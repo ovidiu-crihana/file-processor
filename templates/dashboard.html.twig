@@ -1,0 +1,22 @@
+{% extends 'base.html.twig' %}
+{% block title %}Dashboard{% endblock %}
+{% block body %}
+    <h3>Job di processamento</h3>
+
+    <form id="startForm" class="controls">
+        <label><input type="checkbox" name="dryRun" checked> Dry Run</label>
+        <label>Limit: <input type="number" name="limit" value="100"></label>
+        <label><input type="checkbox" name="resume"> Resume</label>
+        <button type="submit">▶️ Avvia</button>
+        <button id="stopBtn" type="button" class="stop">🛑 Stop</button>
+    </form>
+
+    <div id="statusBox">
+        <p>🟡 Stato: <span id="jobStatus">Idle</span></p>
+        <p>Progress: <progress id="progress" value="0" max="100"></progress> <span id="percent">0%</span></p>
+        <p>Errori: <span id="errorCount">0</span> | Ultimo record: <span id="lastRecord">-</span></p>
+    </div>
+
+    <pre id="logBox" class="log"></pre>
+    <script src="{{ asset('js/dashboard.js') }}"></script>
+{% endblock %}
