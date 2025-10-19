@@ -160,7 +160,7 @@ class FileProcessor
 
         while (($data = fgetcsv($h, 0, ';')) !== false) {
             if (count($data) !== count($header)) continue;
-            $r = array_combine($header, $data);
+            $r = array_combine(array_map(fn($h) => trim(str_replace("\xEF\xBB\xBF", '', $h)), $header), $data);
             if (strcasecmp(trim($r[$this->filterCol] ?? ''), $this->filterVal) === 0) {
                 $rows[] = $r;
             }
