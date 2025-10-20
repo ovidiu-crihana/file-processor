@@ -9,7 +9,7 @@ use Symfony\Component\Console\Style\SymfonyStyle;
 
 class CheckEnvironmentCommand extends Command
 {
-    // 1️⃣  imposta sempre un nome esplicito
+    // 1️ imposta sempre un nome esplicito
     protected static $defaultName = 'app:check-environment';
     protected static $defaultDescription = 'Esegue il controllo completo dell’ambiente e delle dipendenze';
 
@@ -21,7 +21,7 @@ class CheckEnvironmentCommand extends Command
         $this->checkService = $checkService;
     }
 
-    // 3️⃣  per compatibilità aggiungi comunque un setName()
+    // per compatibilità aggiungi comunque un setName()
     protected function configure(): void
     {
         $this->setName(self::$defaultName);
