@@ -4,22 +4,16 @@ namespace App\Service;
 use Symfony\Component\Console\Style\SymfonyStyle;
 use Symfony\Component\Filesystem\Filesystem;
 
-/**
- * Gestisce l'elaborazione dei file dal CSV:
- *  - Lettura CSV
- *  - Filtraggio STATO = CORRETTO
- *  - Raggruppamento logico dinamico (CSV_GROUP_KEYS)
- *  - Log dettagliato per ogni gruppo
- *  - Checkpoint a fine gruppo
- *  - Resume coerente
- */
 class FileProcessor
 {
     private Filesystem $fs;
+
     private string $csvPath;
     private string $checkpointFile;
     private string $filterCol;
     private string $filterVal;
+    private array $groupKeys;
+    private string $idCol;
 
     public function __construct(
         private readonly LoggerService $logger,
@@ -30,11 +24,10 @@ class FileProcessor
         $this->checkpointFile = $_ENV['CHECKPOINT_FILE'] ?? 'var/state/checkpoint.json';
         $this->filterCol      = $_ENV['CSV_FILTER_COLUMN'] ?? 'STATO';
         $this->filterVal      = $_ENV['CSV_FILTER_VALUE'] ?? 'CORRETTO';
+        $this->groupKeys      = array_map('trim', explode(',', $_ENV['CSV_GROUP_KEYS'] ?? 'BATCH,PROT_PRAT_NUMERO'));
+        $this->idCol          = $_ENV['CSV_COL_IDRECORD'] ?? 'IDRECORD';
     }
 
-    /**
-     * Esegue il processo principale.
-     */
     public function run(SymfonyStyle $io, bool $dryRun = false, bool $resume = false, int $limit = 0): array
     {
         $start = microtime(true);
@@ -45,45 +38,32 @@ class FileProcessor
             return ['processed' => 0, 'total' => 0, 'duration' => '00:00:00'];
         }
 
-        // --- Lettura CSV -----------------------------------------------------
         $rows = $this->loadCsv();
-        if ($limit > 0 && $limit < count($rows)) {
-            $rows = array_slice($rows, 0, $limit);
-        }
+        if ($limit > 0 && $limit < count($rows)) $rows = array_slice($rows, 0, $limit);
         $total = count($rows);
         $io->text("Trovati {$total} record da elaborare.");
         if ($total === 0) return ['processed' => 0, 'total' => 0, 'duration' => '00:00:00'];
 
-        // --- Lettura chiavi di raggruppamento --------------------------------
-        $groupKeys = array_map('trim', explode(',', $_ENV['CSV_GROUP_KEYS'] ?? 'BATCH,PROT_PRAT_NUMERO'));
         $io->section('Raggruppamento logico');
-        $io->text('Chiavi di gruppo: ' . implode(', ', $groupKeys));
+        $io->text('Chiavi di gruppo: ' . implode(', ', $this->groupKeys));
 
-        // --- Resume: se richiesto, salta i gruppi già completati ------------
         $resumeKey = null;
         if ($resume && file_exists($this->checkpointFile)) {
             $data = json_decode(file_get_contents($this->checkpointFile), true);
-            if (!empty($data['last_group'])) {
-                $resumeKey = $data['last_group'];
-                $io->note("Ripresa dal gruppo successivo a: {$resumeKey}");
-            }
+            if (!empty($data['last_group'])) $resumeKey = $data['last_group'];
         }
 
-        // --- Raggruppamento dinamico ----------------------------------------
+        // --- Raggruppamento dinamico
         $grouped = [];
         foreach ($rows as $r) {
             $values = [];
-            foreach ($groupKeys as $col) {
-                $values[] = trim($r[$col] ?? '');
-            }
+            foreach ($this->groupKeys as $col) $values[] = trim($r[$col] ?? '');
             $key = implode('|', $values);
             $grouped[$key][] = $r;
         }
 
         $keys = array_keys($grouped);
         $io->progressStart(count($keys));
-
-        // ...
         $processed = 0;
         $skip = $resume && $resumeKey !== null;
 
@@ -94,23 +74,18 @@ class FileProcessor
             }
 
             $records = $grouped[$groupKey];
-
-            // LOG gruppo
-            $count = count($records);
+            $count   = count($records);
             $io->newLine(1);
             $io->text("→ Gruppo: <info>{$groupKey}</info> ({$count} record)");
             $this->logger->info("Inizio gruppo {$groupKey} ({$count} record)");
 
-            // Ordina le pagine per IDRECORD numerico crescente
-            $idCol = $_ENV['CSV_COL_IDRECORD'] ?? 'IDRECORD';
-            usort($records, function(array $a, array $b) use ($idCol) {
-                $aa = (int)preg_replace('/\D+/', '', (string)($a[$idCol] ?? '0'));
-                $bb = (int)preg_replace('/\D+/', '', (string)($b[$idCol] ?? '0'));
+            usort($records, function(array $a, array $b) {
+                $aa = (int)preg_replace('/\D+/', '', (string)($a[$this->idCol] ?? '0'));
+                $bb = (int)preg_replace('/\D+/', '', (string)($b[$this->idCol] ?? '0'));
                 return $aa <=> $bb;
             });
 
             try {
-                // MERGE unico per gruppo
                 $this->ops->mergeGroup($groupKey, $records, $dryRun);
                 $processed += $count;
             } catch (\Throwable $e) {
@@ -118,37 +93,26 @@ class FileProcessor
                 $io->warning("Errore sul gruppo {$groupKey}");
             }
 
-            // checkpoint SOLO a fine gruppo
             $this->safeWriteCheckpoint([
-                'processed'   => $processed,
-                'total'       => $total,
-                'last_group'  => $groupKey,
-                'updated_at'  => date('c')
+                'processed'  => $processed,
+                'total'      => $total,
+                'last_group' => $groupKey,
+                'updated_at' => date('c'),
             ], $this->checkpointFile);
 
             $this->logger->info("Gruppo completato: {$groupKey}");
             $io->progressAdvance();
         }
-// ...
-
 
         $io->progressFinish();
         $elapsed = microtime(true) - $start;
         $formatted = gmdate('H:i:s', (int)$elapsed);
-
         $this->logger->info("Elaborazione completata: {$processed}/{$total} file in {$formatted}");
         $io->success("Completato: {$processed} file su {$total} in {$formatted}");
 
-        return [
-            'processed' => $processed,
-            'total'     => $total,
-            'duration'  => $formatted
-        ];
+        return ['processed' => $processed, 'total' => $total, 'duration' => $formatted];
     }
 
-    /**
-     * Lettura CSV e filtro STATO = CORRETTO.
-     */
     private function loadCsv(): array
     {
         $rows = [];
@@ -161,17 +125,12 @@ class FileProcessor
         while (($data = fgetcsv($h, 0, ';')) !== false) {
             if (count($data) !== count($header)) continue;
             $r = array_combine(array_map(fn($h) => trim(str_replace("\xEF\xBB\xBF", '', $h)), $header), $data);
-            if (strcasecmp(trim($r[$this->filterCol] ?? ''), $this->filterVal) === 0) {
-                $rows[] = $r;
-            }
+            if (strcasecmp(trim($r[$this->filterCol] ?? ''), $this->filterVal) === 0) $rows[] = $r;
         }
         fclose($h);
         return $rows;
     }
 
-    /**
-     * Scrittura sicura del checkpoint (compatibile con Windows)
-     */
     private function safeWriteCheckpoint(array $data, string $path): void
     {
         $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
@@ -183,7 +142,7 @@ class FileProcessor
                 rename($tmp, $path);
                 return;
             } catch (\Throwable $e) {
-                usleep(200_000); // 200ms retry
+                usleep(200_000);
             }
         }
         try {

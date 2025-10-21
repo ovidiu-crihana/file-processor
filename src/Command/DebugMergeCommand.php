@@ -11,17 +11,38 @@ use Symfony\Component\Console\Style\SymfonyStyle;
 
 /**
  * Mostra un riepilogo per ogni gruppo logico (senza generare file)
- * con percorso completo e nome file previsto.
+ * con percorso completo, nome file previsto e conteggio tavole.
  */
 #[AsCommand(
     name: 'app:debug-merge',
-    description: 'Mostra il riepilogo dei gruppi e verifica i file disponibili'
+    description: 'Mostra il riepilogo dei gruppi e verifica i file disponibili (inclusi eventuali TAVOLE)'
 )]
 class DebugMergeCommand extends Command
 {
+    private string $csvPath;
+    private array $groupKeys;
+    private string $filterCol;
+    private string $filterVal;
+
+    // configurazioni tavole
+    private ?string $tavoleColumn;
+    private ?string $tavoleValue;
+    private ?string $tavolePath;
+    private string $sourceBase;
+
     public function __construct(private readonly FileOperations $ops)
     {
         parent::__construct();
+
+        $this->csvPath      = $_ENV['CSV_PATH'] ?? '';
+        $this->groupKeys    = array_map('trim', explode(',', $_ENV['CSV_GROUP_KEYS'] ?? 'BATCH,IDDOCUMENTO'));
+        $this->filterCol    = $_ENV['CSV_FILTER_COLUMN'] ?? 'STATO';
+        $this->filterVal    = $_ENV['CSV_FILTER_VALUE'] ?? 'CORRETTO';
+
+        $this->tavoleColumn = $_ENV['TAVOLE_TRIGGER_COLUMN'] ?? null;
+        $this->tavoleValue  = $_ENV['TAVOLE_TRIGGER_VALUE'] ?? null;
+        $this->tavolePath   = $_ENV['TAVOLE_PATH'] ?? 'tavole';
+        $this->sourceBase   = $_ENV['SOURCE_BASE_PATH'] ?? '';
     }
 
     protected function configure(): void
@@ -34,21 +55,19 @@ class DebugMergeCommand extends Command
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
         $io = new SymfonyStyle($input, $output);
-        $csvPath = $_ENV['CSV_PATH'] ?? '';
 
-        if (!file_exists($csvPath)) {
-            $io->error("CSV non trovato: {$csvPath}");
+        if (!file_exists($this->csvPath)) {
+            $io->error("CSV non trovato: {$this->csvPath}");
             return Command::FAILURE;
         }
 
-        $groupKeys = array_map('trim', explode(',', $_ENV['CSV_GROUP_KEYS'] ?? 'BATCH,IDDOCUMENTO'));
         $filterGroup = $input->getOption('group');
-        $limit = (int) $input->getOption('limit');
+        $limit = (int)$input->getOption('limit');
 
         $io->section('Analisi gruppi logici');
-        $io->text('Chiavi di gruppo: ' . implode(', ', $groupKeys));
+        $io->text('Chiavi di gruppo: ' . implode(', ', $this->groupKeys));
 
-        $rows = $this->loadCsv($csvPath);
+        $rows = $this->loadCsv($this->csvPath);
         if (empty($rows)) {
             $io->warning('Nessun record valido (filtrati STATO != CORRETTO).');
             return Command::SUCCESS;
@@ -58,7 +77,7 @@ class DebugMergeCommand extends Command
         $grouped = [];
         foreach ($rows as $r) {
             $values = [];
-            foreach ($groupKeys as $col) $values[] = trim($r[$col] ?? '');
+            foreach ($this->groupKeys as $col) $values[] = trim($r[$col] ?? '');
             $key = implode('|', $values);
             $grouped[$key][] = $r;
         }
@@ -77,12 +96,25 @@ class DebugMergeCommand extends Command
             $group = explode('|', $key)[1] ?? '';
             $countTotal = count($records);
 
-            // verifica file
             $found = 0;
             $missing = 0;
+            $tavoleFound = 0;
+            $tavoleRequired = false;
+
             foreach ($records as $r) {
                 $src = $this->ops->buildSourcePath($r);
-                if ($src && file_exists($src)) $found++; else $missing++;
+                if ($src && file_exists($src)) {
+                    $found++;
+                } else {
+                    $missing++;
+                }
+
+                // --- verifica tavole aggiuntive per questo record
+                if ($this->shouldUseTavole($r)) {
+                    $tavoleRequired = true;
+                    $tavole = $this->findTavoleFiles($r);
+                    $tavoleFound += count($tavole);
+                }
             }
 
             // costruzione nome finale
@@ -109,10 +141,18 @@ class DebugMergeCommand extends Command
             $status = $found === 0 ? '❌ Nessun file trovato'
                 : ($found < $countTotal ? '⚠️ Parziale' : '✅ Completo');
 
+            // testo tavole più esplicativo
+            if ($tavoleRequired) {
+                $tavoleText = 'Sì (' . $tavoleFound . ')';
+            } else {
+                $tavoleText = 'No';
+            }
+
             $summary[] = [
                 'Gruppo' => $key,
                 'Record' => $countTotal,
                 'Trovati' => "{$found}/{$countTotal}",
+                'Tavole' => $tavoleText,
                 'Stato' => $status,
                 'Path' => $destFolder,
                 'Filename' => $baseName,
@@ -123,7 +163,7 @@ class DebugMergeCommand extends Command
 
         $io->newLine();
         $io->table(
-            ['Gruppo', 'Record', 'Trovati', 'Stato', 'Path', 'Filename'],
+            ['Gruppo', 'Record', 'Trovati', 'Tavole', 'Stato', 'Path', 'Filename'],
             $summary
         );
 
@@ -136,8 +176,6 @@ class DebugMergeCommand extends Command
     private function loadCsv(string $path): array
     {
         $rows = [];
-        $filterCol = $_ENV['CSV_FILTER_COLUMN'] ?? 'STATO';
-        $filterVal = $_ENV['CSV_FILTER_VALUE'] ?? 'CORRETTO';
         $h = fopen($path, 'r');
         if (!$h) return [];
 
@@ -147,9 +185,88 @@ class DebugMergeCommand extends Command
         while (($data = fgetcsv($h, 0, ';')) !== false) {
             if (count($data) !== count($header)) continue;
             $r = array_combine($header, $data);
-            if (strcasecmp(trim($r[$filterCol] ?? ''), $filterVal) === 0) $rows[] = $r;
+            if (strcasecmp(trim($r[$this->filterCol] ?? ''), $this->filterVal) === 0) $rows[] = $r;
         }
         fclose($h);
         return $rows;
+    }
+
+    // --- logica TAVOLE in linea con FileOperations ------------------------
+
+    /**
+     * Determina se per questo record devono essere ricercate le tavole.
+     *
+     * Supporta tre modalità di ricerca (case-insensitive):
+     *
+     * 1️⃣ Parola singola:
+     *     TAVOLE_TRIGGER_VALUE=TAVOLA
+     *     → attiva se la colonna contiene la parola "TAVOLA"
+     *       (es. "TAVOLA_1", "TavolaTecnica", ecc.)
+     *
+     * 2️⃣ Lista di parole (separate da virgola):
+     *     TAVOLE_TRIGGER_VALUE=TAVOLA,PIANTA,CARTA
+     *     → attiva se la colonna contiene almeno una di queste parole
+     *
+     * 3️⃣ Pattern regex:
+     *     TAVOLE_TRIGGER_VALUE=/TAVOLA[_\-\s]?\d{0,2}/i
+     *     → attiva se la colonna rispetta il pattern indicato
+     *       (es. "TAVOLA_1", "TAVOLA-02", "tavola 10")
+     *
+     * La regex deve essere racchiusa tra "/" e può includere flag "i" per ignore-case.
+     */
+    private function shouldUseTavole(array $r): bool
+    {
+        if (!$this->tavoleColumn || !$this->tavoleValue) {
+            return false;
+        }
+
+        $fieldValue = trim($r[$this->tavoleColumn] ?? '');
+        $pattern = $this->tavoleValue;
+
+        // Caso 3: pattern regex
+        if (preg_match('/^\/.+\/[a-zA-Z]*$/', $pattern)) {
+            return (bool) preg_match($pattern, $fieldValue);
+        }
+
+        // Caso 2: lista di parole
+        if (str_contains($pattern, ',')) {
+            foreach (array_map('trim', explode(',', $pattern)) as $word) {
+                if (stripos($fieldValue, $word) !== false) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Caso 1: parola singola
+        return stripos($fieldValue, $pattern) !== false;
+    }
+
+
+    private function findTavoleFiles(array $r): array
+    {
+        $files = [];
+        if (!$this->shouldUseTavole($r)) return $files;
+
+        $acq  = preg_replace('/\D+/', '', (string)($r['DATA_ORA_ACQ'] ?? ''));
+        $yyyy = substr($acq, 0, 4);
+        $mm   = substr($acq, 4, 2);
+        $dd   = substr($acq, 6, 2);
+        $batch = trim($r['BATCH'] ?? '');
+        $file  = trim($r['IMMAGINE'] ?? '');
+
+        // Percorso base: relativo o assoluto
+        if (str_starts_with($this->tavolePath, '\\') || str_contains($this->tavolePath, ':')) {
+            $base = rtrim($this->tavolePath, '\\/') . "\\{$batch}";
+        } else {
+            $base = rtrim($this->sourceBase, '\\/') . "\\{$yyyy}\\{$mm}\\{$dd}\\{$batch}\\{$this->tavolePath}";
+        }
+
+        if (is_dir($base)) {
+            foreach (glob($base . '\\*.tif') as $f) {
+                $files[] = $f;
+            }
+        }
+        return $files;
     }
 }
