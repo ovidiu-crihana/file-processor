@@ -14,7 +14,6 @@ use Symfony\Component\Filesystem\Filesystem;
  * - Verifica variabili .env principali
  * - Testa la presenza e i permessi di file e directory
  * - Mostra versione PHP, ImageMagick, dimensione CSV
- * - Gestisce warning opzionali (es. TAVOLE_PATH)
  */
 #[AsCommand(
     name: 'app:check-environment',
@@ -42,7 +41,7 @@ class CheckEnvironmentCommand extends Command
             'OUTPUT_BASE_PATH',
             'IMAGEMAGICK_PATH',
             'LOG_FILE',
-            'TAVOLE_PATH',
+            'TAVOLE_BASE_PATH',
         ];
 
         $rows = [];
@@ -75,7 +74,7 @@ class CheckEnvironmentCommand extends Command
                     }
                 } else {
                     // Distinzione tra errori e warning opzionali
-                    if ($v === 'TAVOLE_PATH') {
+                    if ($v === 'TAVOLE_BASE_PATH') {
                         $status = 'ℹ️ Opzionale';
                         $detail = 'Percorso non trovato (tavole non attive)';
                         $warnings++;

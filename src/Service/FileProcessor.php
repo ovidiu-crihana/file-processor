@@ -161,7 +161,7 @@ final class FileProcessor
 
 
             $baseName = $this->buildOutputBase($first, $suffixTitolo);
-            $tifDir = $outputBase . "\\TIF\\" . $folderNum;
+            $tifDir = $outputBase . "\\TIFF\\" . $folderNum;
             $pdfDir = $outputBase . "\\PDF\\" . $folderNum;
             @mkdir($tifDir, 0777, true);
             @mkdir($pdfDir, 0777, true);
