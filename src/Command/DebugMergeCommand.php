@@ -1,6 +1,9 @@
 <?php
+declare(strict_types=1);
+
 namespace App\Command;
 
+use App\Service\CsvReader;
 use App\Service\FileOperations;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
@@ -9,264 +12,205 @@ use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Style\SymfonyStyle;
 
-/**
- * Mostra un riepilogo per ogni gruppo logico (senza generare file)
- * con percorso completo, nome file previsto e conteggio tavole.
- */
 #[AsCommand(
     name: 'app:debug-merge',
-    description: 'Mostra il riepilogo dei gruppi e verifica i file disponibili (inclusi eventuali TAVOLE)'
+    description: 'Anteprima gruppi, numerazione cartelle e nomi output'
 )]
-class DebugMergeCommand extends Command
+final class DebugMergeCommand extends Command
 {
-    private string $csvPath;
-    private array $groupKeys;
-    private string $filterCol;
-    private string $filterVal;
-
-    // configurazioni tavole
-    private ?string $tavoleColumn;
-    private ?string $tavoleValue;
-    private ?string $tavolePath;
-    private string $sourceBase;
-
-    public function __construct(private readonly FileOperations $ops)
-    {
+    public function __construct(
+    ) {
         parent::__construct();
-
-        $this->csvPath      = $_ENV['CSV_PATH'] ?? '';
-        $this->groupKeys    = array_map('trim', explode(',', $_ENV['CSV_GROUP_KEYS'] ?? 'BATCH,IDDOCUMENTO'));
-        $this->filterCol    = $_ENV['CSV_FILTER_COLUMN'] ?? 'STATO';
-        $this->filterVal    = $_ENV['CSV_FILTER_VALUE'] ?? 'CORRETTO';
-
-        $this->tavoleColumn = $_ENV['TAVOLE_TRIGGER_COLUMN'] ?? null;
-        $this->tavoleValue  = $_ENV['TAVOLE_TRIGGER_VALUE'] ?? null;
-        $this->tavolePath   = $_ENV['TAVOLE_PATH'] ?? 'tavole';
-        $this->sourceBase   = $_ENV['SOURCE_BASE_PATH'] ?? '';
     }
 
     protected function configure(): void
     {
         $this
-            ->addOption('group', null, InputOption::VALUE_OPTIONAL, 'Filtra per chiave gruppo (BATCH|IDDOCUMENTO)')
-            ->addOption('limit', null, InputOption::VALUE_OPTIONAL, 'Limita il numero di gruppi mostrati', 20);
+            ->addOption('batch',        null, InputOption::VALUE_REQUIRED, 'Filtra per BATCH', null)
+            ->addOption('tipo',         null, InputOption::VALUE_REQUIRED, 'Filtra per TIPO_DOCUMENTO', null)
+            ->addOption('limit',        null, InputOption::VALUE_REQUIRED, 'Limita gruppi mostrati (0=tutti)', '0')
+            ->addOption('max-rows',     null, InputOption::VALUE_REQUIRED, 'Leggi massimo N righe dal CSV (0=tutte)', '0')
+            ->addOption('show-files',   null, InputOption::VALUE_NONE,     'Elenca i file dei gruppi (potrebbero essere tanti)')
+            ->addOption('verbose-scan', null, InputOption::VALUE_NONE,     'Stampa motivi di skip riga (diagnostica)')
+            ->addOption('summary-only', null, InputOption::VALUE_NONE,     'Mostra solo riepilogo finale (niente gruppi).');
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $io = new SymfonyStyle($input, $output);
-
-        if (!file_exists($this->csvPath)) {
-            $io->error("CSV non trovato: {$this->csvPath}");
+        $io        = new SymfonyStyle($input, $output);
+        $csvPath   = $_ENV['CSV_PATH'] ?? '';
+        if (!$csvPath || !is_file($csvPath)) {
+            $io->error('CSV_PATH non impostato o file non trovato.');
             return Command::FAILURE;
         }
 
-        $filterGroup = $input->getOption('group');
-        $limit = (int)$input->getOption('limit');
+        $batchF    = $input->getOption('batch') ?: null;
+        $tipoF     = $input->getOption('tipo')  ?: null;
+        $limit     = (int)$input->getOption('limit');
+        $maxRows   = (int)$input->getOption('max-rows');
+        $showFiles = (bool)$input->getOption('show-files');
+        $summary   = (bool)$input->getOption('summary-only');
+        $vscan     = (bool)$input->getOption('verbose-scan');
 
-        $io->section('Analisi gruppi logici');
-        $io->text('Chiavi di gruppo: ' . implode(', ', $this->groupKeys));
-
-        $rows = $this->loadCsv($this->csvPath);
-        if (empty($rows)) {
-            $io->warning('Nessun record valido (filtrati STATO != CORRETTO).');
-            return Command::SUCCESS;
-        }
-
-        // Raggruppamento dinamico
-        $grouped = [];
-        foreach ($rows as $r) {
-            $values = [];
-            foreach ($this->groupKeys as $col) $values[] = trim($r[$col] ?? '');
-            $key = implode('|', $values);
-            $grouped[$key][] = $r;
-        }
-
-        $totalGroups = count($grouped);
-        $io->text("Trovati {$totalGroups} gruppi totali.");
-
-        $shown = 0;
-        $summary = [];
-
-        foreach ($grouped as $key => $records) {
-            if ($filterGroup && stripos($key, $filterGroup) === false) continue;
-            if ($limit > 0 && $shown >= $limit) break;
-
-            $batch = explode('|', $key)[0] ?? '';
-            $group = explode('|', $key)[1] ?? '';
-            $countTotal = count($records);
-
-            $found = 0;
-            $missing = 0;
-            $tavoleFound = 0;
-            $tavoleRequired = false;
-
-            foreach ($records as $r) {
-                $src = $this->ops->buildSourcePath($r);
-                if ($src && file_exists($src)) {
-                    $found++;
-                } else {
-                    $missing++;
-                }
-
-                // --- verifica tavole aggiuntive per questo record
-                if ($this->shouldUseTavole($r)) {
-                    $tavoleRequired = true;
-                    $tavole = $this->findTavoleFiles($r);
-                    $tavoleFound += count($tavole);
-                }
-            }
-
-            // costruzione nome finale
-            $destFolder = "\\{$batch}\\{$group}";
-            $first = $records[0];
-            $pattern = $_ENV['OUTPUT_FILENAME_PATTERN'] ?? '{TIPO_PRATICA}_{PRAT_NUM}_{ANNO}_{TIPO_DOCUMENTO}_{NUMERO_RELATIVO}.tif';
-            $tipoPratica = $first['TIPO_PRATICA'] ?? '';
-            $pratNum = $first['PRAT_NUM'] ?? '';
-            $anno = substr(preg_replace('/\D+/', '', (string)($first['PROT_PRAT_DATA'] ?? '')), -4);
-            $tipoDoc = $first['TIPO_DOCUMENTO'] ?? '';
-            $sigla = $first['SIGLA_PRATICA'] ?? '';
-            $elaborato = (stripos($tipoDoc, 'titolo autorizzativo') !== false) ? $sigla : $tipoDoc;
-
-            $finalName = strtr($pattern, [
-                '{TIPO_PRATICA}' => $tipoPratica,
-                '{PRAT_NUM}' => $pratNum,
-                '{ANNO}' => $anno,
-                '{TIPO_DOCUMENTO}' => $elaborato,
-                '{NUMERO_RELATIVO}' => $group,
-            ]);
-
-            $baseName = pathinfo($finalName, PATHINFO_FILENAME);
-
-            $status = $found === 0 ? '❌ Nessun file trovato'
-                : ($found < $countTotal ? '⚠️ Parziale' : '✅ Completo');
-
-            // testo tavole più esplicativo
-            if ($tavoleRequired) {
-                $tavoleText = 'Sì (' . $tavoleFound . ')';
-            } else {
-                $tavoleText = 'No';
-            }
-
-            $summary[] = [
-                'Gruppo' => $key,
-                'Record' => $countTotal,
-                'Trovati' => "{$found}/{$countTotal}",
-                'Tavole' => $tavoleText,
-                'Stato' => $status,
-                'Path' => $destFolder,
-                'Filename' => $baseName,
-            ];
-
-            $shown++;
-        }
-
+        $io->title("Anteprima merge e output ($csvPath)");
         $io->newLine();
-        $io->table(
-            ['Gruppo', 'Record', 'Trovati', 'Tavole', 'Stato', 'Path', 'Filename'],
-            $summary
-        );
 
-        $io->success("Analisi completata: mostrati {$shown} gruppi su {$totalGroups}.");
-        $io->text('Usa --limit=<N> o --group="<parte chiave>" per filtrare.');
+        // ENV
+        $sourceBase   = rtrim($_ENV['SOURCE_BASE_PATH'] ?? '', '\\/');
+        $tavoleBase   = rtrim($_ENV['TAVOLE_BASE_PATH']  ?? 'Work\\Tavole\\Importate', '\\/');
+        $triggerRx    = $_ENV['TAVOLE_TRIGGER_PATTERN'] ?? '^[A-Za-z0-9]+\\.$';
+        $planVals     = array_values(array_filter(array_map('trim', explode(';', $_ENV['TAVOLE_PLANIMETRIE_VALUES'] ?? 'ELABORATO_GRAFICO'))));
+        $suffixTitolo = $_ENV['OUTPUT_SUFFIX_TITOLO_AUTORIZZATIVO'] ?? '';
 
-        return Command::SUCCESS;
-    }
+        // Stati
+        $currentFolderKey = null; // (BATCH|IDDOCUMENTO)
+        $currentFolderNum = 0;
+        $currentGroupKey  = null; // (BATCH|TIPO_DOCUMENTO)
+        $currentPrefix    = null; // prefisso tavole nello scope (BATCH, IDDOCUMENTO)
 
-    private function loadCsv(string $path): array
-    {
-        $rows = [];
-        $h = fopen($path, 'r');
-        if (!$h) return [];
+        $groupFiles = [];
+        $groupRows  = [];
+        $shownGroups = 0;
 
-        $header = fgetcsv($h, 0, ';');
-        $header = array_map(fn($h) => trim(str_replace("\xEF\xBB\xBF", '', $h)), $header);
+        // Diagnostica
+        $rowsRead = 0;
+        $rowsCorretto = 0;
+        $rowsFiltered = 0;
+        $rowsTriggers = 0;
+        $rowsSkipped = 0;
+        $totalFolders = 0;
 
-        while (($data = fgetcsv($h, 0, ';')) !== false) {
-            if (count($data) !== count($header)) continue;
-            $r = array_combine($header, $data);
-            if (strcasecmp(trim($r[$this->filterCol] ?? ''), $this->filterVal) === 0) $rows[] = $r;
-        }
-        fclose($h);
-        return $rows;
-    }
+        // Helpers
+        $buildOutputName = function(array $row) use ($suffixTitolo): string {
+            $tipo  = trim($row['TIPO_PRATICA'] ?? '');
+            $prot  = trim($row['PROT_PRAT_NUMERO'] ?? '');
+            $data  = trim($row['PROT_PRAT_DATA'] ?? '');
+            $anno  = substr(preg_replace('/[^0-9]/', '', $data), -4);
+            $doc   = trim($row['TIPO_DOCUMENTO'] ?? '');
+            $suff  = ($doc === 'TITOLO_AUTORIZZATIVO' && $suffixTitolo !== '') ? $suffixTitolo : '';
+            $name  = "{$tipo}_{$prot}_{$anno}_{$doc}{$suff}";
+            $name  = str_replace([' ', '/', '\\', ':', '*', '?', '"', '<', '>', '|'], '_', $name);
+            return preg_replace('/_+/', '_', $name);
+        };
+        $resolveSource = function(array $row, bool $isPlanimetria) use ($sourceBase, $tavoleBase, &$currentPrefix) {
+            $nomeFile = trim($row['IMMAGINE'] ?? '');
+            $batch    = trim($row['BATCH'] ?? '');
+            $tsStr    = trim($row['DATA_ORA_ACQ'] ?? '');
+            $ts       = strtotime($tsStr);
+            if ($ts === false) return "[INVALID_DATE] {$nomeFile}";
+            $yyyy = date('Y', $ts); $mm = date('m', $ts); $dd = date('d', $ts);
 
-    // --- logica TAVOLE in linea con FileOperations ------------------------
+            if ($isPlanimetria) {
+                if (!$currentPrefix) return "[MISSING_PREFIX] {$nomeFile}";
+                return "{$tavoleBase}\\{$currentPrefix}{$nomeFile}";
+            }
+            return "{$sourceBase}\\{$yyyy}\\{$mm}\\{$dd}\\{$batch}\\{$nomeFile}";
+        };
+        $flushGroup = function() use (&$groupFiles, &$groupRows, &$currentFolderNum, &$shownGroups, $limit, $io, $buildOutputName, $showFiles, &$currentFolderKey, &$totalFolders, $summary) {
+            if (empty($groupFiles) || empty($groupRows)) return;
+            $first = $groupRows[0];
+            $out   = $buildOutputName($first);
+            $pages = count($groupFiles);
 
-    /**
-     * Determina se per questo record devono essere ricercate le tavole.
-     *
-     * Supporta tre modalità di ricerca (case-insensitive):
-     *
-     * 1️⃣ Parola singola:
-     *     TAVOLE_TRIGGER_VALUE=TAVOLA
-     *     → attiva se la colonna contiene la parola "TAVOLA"
-     *       (es. "TAVOLA_1", "TavolaTecnica", ecc.)
-     *
-     * 2️⃣ Lista di parole (separate da virgola):
-     *     TAVOLE_TRIGGER_VALUE=TAVOLA,PIANTA,CARTA
-     *     → attiva se la colonna contiene almeno una di queste parole
-     *
-     * 3️⃣ Pattern regex:
-     *     TAVOLE_TRIGGER_VALUE=/TAVOLA[_\-\s]?\d{0,2}/i
-     *     → attiva se la colonna rispetta il pattern indicato
-     *       (es. "TAVOLA_1", "TAVOLA-02", "tavola 10")
-     *
-     * La regex deve essere racchiusa tra "/" e può includere flag "i" per ignore-case.
-     */
-    private function shouldUseTavole(array $r): bool
-    {
-        if (!$this->tavoleColumn || !$this->tavoleValue) {
-            return false;
-        }
+            if (!$summary) {
+                $batch = $first['BATCH'] ?? '';
+                $iddoc = $first['IDDOCUMENTO'] ?? '';
+                $isTavole = str_contains($out, 'ELABORATO_GRAFICO') || str_contains($out, 'PLANIMETRIA');
+                $label = $isTavole ? "⭐️ [TAVOLE]" : "";
+                $folderLabel = sprintf("🗂️ Cartella #%03d %s (BATCH=%s, IDDOC=%s)", $currentFolderNum, $label, $batch, $iddoc);
+                $io->section($folderLabel);
+                $io->text("Output: {$out}.tif / {$out}.pdf");
+                $io->text("Pagine: {$pages}");
+                if ($showFiles) $io->listing(array_map(fn($f) => " - $f", $groupFiles));
+            }
 
-        $fieldValue = trim($r[$this->tavoleColumn] ?? '');
-        $pattern = $this->tavoleValue;
+            $groupFiles = []; $groupRows = [];
+            $shownGroups++;
+            if ($limit > 0 && $shownGroups >= $limit) throw new \RuntimeException('__STOP__');
+        };
 
-        // Caso 3: pattern regex
-        if (preg_match('/^\/.+\/[a-zA-Z]*$/', $pattern)) {
-            return (bool) preg_match($pattern, $fieldValue);
-        }
+        try {
+            $timeStart = microtime(true);
+            $memStart = memory_get_usage();
 
-        // Caso 2: lista di parole
-        if (str_contains($pattern, ',')) {
-            foreach (array_map('trim', explode(',', $pattern)) as $word) {
-                if (stripos($fieldValue, $word) !== false) {
-                    return true;
+            foreach (CsvReader::iterate($csvPath) as $row) {
+                if ($maxRows > 0 && $rowsRead >= $maxRows) break;
+                $rowsRead++;
+
+                $stato = strtoupper(trim($row['STATO'] ?? ''));
+                $batch = trim($row['BATCH'] ?? '');
+                $iddoc = trim($row['IDDOCUMENTO'] ?? '');
+                $tipo  = trim($row['TIPO_DOCUMENTO'] ?? '');
+
+                // Filtri opzionali
+                if ($batchF && $batch !== $batchF && $rowsCorretto > 0) {
+                    break;
                 }
+                if ($tipoF  && $tipo  !== $tipoF)   { $rowsFiltered++; continue; }
+
+                // Trigger tavole: riga non corretta + match regex
+                if ($stato !== 'CORRETTO' && preg_match('/'.$triggerRx.'/i', $tipo)) {
+                    $currentPrefix = $tipo; $rowsTriggers++;
+                    if ($vscan) $io->text("trigger: set prefix {$currentPrefix} (BATCH=$batch, IDDOC=$iddoc)");
+                    continue;
+                }
+
+                // Skip righe non corrette
+                if ($stato !== 'CORRETTO') { $rowsSkipped++; continue; }
+                $rowsCorretto++;
+
+                $folderKey = "{$batch}|{$iddoc}";
+                $groupKey  = "{$batch}|{$tipo}";
+
+                // Cambio cartella numerata
+                if ($folderKey !== $currentFolderKey) {
+                    if ($currentFolderKey !== null && !empty($groupFiles)) $flushGroup();
+                    $currentFolderNum++;
+                    $totalFolders++;
+                    $currentFolderKey = $folderKey;
+                    $currentPrefix = null;
+                }
+
+                // Cambio gruppo
+                if ($groupKey !== $currentGroupKey && $currentGroupKey !== null && !empty($groupFiles)) {
+                    $flushGroup();
+                }
+                $currentGroupKey = $groupKey;
+
+                $isPlanimetria = in_array($tipo, $planVals, true);
+                $src = $resolveSource($row, $isPlanimetria);
+
+                $groupFiles[] = $src;
+                $groupRows[]  = $row;
             }
-            return false;
+
+            if (!empty($groupFiles)) $flushGroup();
+        } catch (\RuntimeException $e) {
+            if ($e->getMessage() !== '__STOP__') throw $e;
         }
 
-        // Caso 1: parola singola
-        return stripos($fieldValue, $pattern) !== false;
-    }
+        $timeEnd = microtime(true);
+        $memEnd = memory_get_peak_usage();
 
+        $elapsed = round($timeEnd - $timeStart, 2);
+        $memoryMb = round($memEnd / 1024 / 1024, 2);
 
-    private function findTavoleFiles(array $r): array
-    {
-        $files = [];
-        if (!$this->shouldUseTavole($r)) return $files;
+        // 🧾 Riepilogo finale
+        $io->section('Riepilogo CSV');
+        $io->listing([
+            "Totale righe lette: {$rowsRead}",
+            "Righe STATO=CORRETTO: {$rowsCorretto}",
+            "Righe skippate (non corrette): {$rowsSkipped}",
+            "Righe filtrate da opzioni: {$rowsFiltered}",
+            "Trigger tavole rilevati: {$rowsTriggers}",
+            "Cartelle numerate totali: {$totalFolders}",
+            "Gruppi generati: {$shownGroups}",
+        ]);
+        $io->newLine();
+        $io->writeln(sprintf(" • Tempo totale: <info>%s sec</info>", number_format($elapsed, 2)));
+        $io->writeln(sprintf(" • Memoria massima: <info>%s MB</info>", number_format($memoryMb, 2)));
 
-        $acq  = preg_replace('/\D+/', '', (string)($r['DATA_ORA_ACQ'] ?? ''));
-        $yyyy = substr($acq, 0, 4);
-        $mm   = substr($acq, 4, 2);
-        $dd   = substr($acq, 6, 2);
-        $batch = trim($r['BATCH'] ?? '');
-        $file  = trim($r['IMMAGINE'] ?? '');
-
-        // Percorso base: relativo o assoluto
-        if (str_starts_with($this->tavolePath, '\\') || str_contains($this->tavolePath, ':')) {
-            $base = rtrim($this->tavolePath, '\\/') . "\\{$batch}";
-        } else {
-            $base = rtrim($this->sourceBase, '\\/') . "\\{$yyyy}\\{$mm}\\{$dd}\\{$batch}\\{$this->tavolePath}";
-        }
-
-        if (is_dir($base)) {
-            foreach (glob($base . '\\*.tif') as $f) {
-                $files[] = $f;
-            }
-        }
-        return $files;
+        $io->success('Anteprima completata.');
+        return Command::SUCCESS;
     }
 }

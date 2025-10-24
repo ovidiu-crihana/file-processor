@@ -1,4 +1,6 @@
 <?php
+declare(strict_types=1);
+
 namespace App\Command;
 
 use App\Service\FileProcessor;
@@ -8,20 +10,15 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Style\SymfonyStyle;
-use Symfony\Component\Filesystem\Filesystem;
 
-/**
- * Comando CLI principale per avviare l’elaborazione dei file
- * dal CSV con supporto a resume, dry-run, limit e checkpoint.
- */
 #[AsCommand(
     name: 'app:process-files',
-    description: 'Processa i file dal CSV applicando le regole definite e mantenendo checkpoint per resume.'
+    description: 'Esegue l’elaborazione effettiva dei gruppi (TIFF → PDF) con resume e checkpoint'
 )]
-class ProcessFilesCommand extends Command
+final class ProcessFilesCommand extends Command
 {
     public function __construct(
-        private readonly FileProcessor $processor
+        private readonly FileProcessor $processor,
     ) {
         parent::__construct();
     }
@@ -29,68 +26,83 @@ class ProcessFilesCommand extends Command
     protected function configure(): void
     {
         $this
-            ->addOption('dry-run', null, InputOption::VALUE_NONE, 'Simulazione: non accede al filesystem (verifica solo logica e output)')
-            ->addOption('resume', null, InputOption::VALUE_NONE, 'Riprende dal checkpoint precedente (se esiste)')
-            ->addOption('limit', null, InputOption::VALUE_REQUIRED, 'Limita il numero massimo di record da processare', 0);
+            ->addOption('dry-run', null, InputOption::VALUE_NONE, 'Simula senza generare i file')
+            ->addOption('resume', null, InputOption::VALUE_NONE, 'Riprende da checkpoint esistente')
+            ->addOption('limit', null, InputOption::VALUE_REQUIRED, 'Numero massimo di gruppi da elaborare', 0)
+            ->addOption('batch', null, InputOption::VALUE_REQUIRED, 'Filtra per batch specifico')
+            ->addOption('tipo', null, InputOption::VALUE_REQUIRED, 'Filtra per tipo documento specifico')
+            ->addOption('yes', 'y', InputOption::VALUE_NONE, 'Salta la conferma interattiva');
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $io     = new SymfonyStyle($input, $output);
-        $fs     = new Filesystem();
+        $io         = new SymfonyStyle($input, $output);
+        $resume     = (bool)$input->getOption('resume');
+        $dryRun     = (bool)$input->getOption('dry-run');
+        $limit      = (int)$input->getOption('limit');
+        $batch      = $input->getOption('batch');
+        $tipo       = $input->getOption('tipo');
+        $autoYes    = (bool)$input->getOption('yes');
 
-        $dryRun = (bool)$input->getOption('dry-run');
-        $resume = (bool)$input->getOption('resume');
-        $limit  = (int)$input->getOption('limit');
-        $checkpointFile = $_ENV['CHECKPOINT_FILE'] ?? 'var/state/checkpoint.json';
+        $io->title('Elaborazione gruppi');
 
-        $io->title('File Processor');
-        $io->section('Inizializzazione e lettura CSV...');
+        // Parametri principali
+        $csvPath       = $_ENV['CSV_PATH'] ?? null;
+        $magickPath    = $_ENV['IMAGEMAGICK_PATH'] ?? 'magick';
+        $checkpoint    = $_ENV['CHECKPOINT_FILE'] ?? 'var/logs/checkpoint.csv';
+        $outputBase    = rtrim($_ENV['OUTPUT_BASE_PATH'] ?? 'Output', '\\/');
+        $sourceBase    = rtrim($_ENV['SOURCE_BASE_PATH'] ?? 'Work', '\\/');
+        $tavoleBase    = rtrim($_ENV['TAVOLE_BASE_PATH'] ?? 'Work\\Tavole\\Importate', '\\/');
+        $tavolePattern = $_ENV['TAVOLE_TRIGGER_PATTERN'] ?? '^[A-Za-z0-9]+\\.?$';
+        $planimVals    = array_filter(array_map('trim', explode(';', $_ENV['TAVOLE_PLANIMETRIE_VALUES'] ?? 'ELABORATO_GRAFICO')));
+        $suffixTitolo  = $_ENV['OUTPUT_SUFFIX_TITOLO_AUTORIZZATIVO'] ?? '';
 
-        // --- Mostra informazioni sul checkpoint se presente ---
-        if ($resume && $fs->exists($checkpointFile)) {
-            $data = json_decode(file_get_contents($checkpointFile), true);
-            if ($data) {
-                $io->note([
-                    'Checkpoint rilevato:',
-                    sprintf('  Ultimo gruppo elaborato: %s', $data['last_group'] ?? '(nessuno)'),
-                    sprintf('  Totale processati: %s / %s', $data['processed'] ?? '?', $data['total'] ?? '?'),
-                    sprintf('  Aggiornato il: %s', $data['updated_at'] ?? '?'),
-                ]);
-            } else {
-                $io->warning('Checkpoint corrotto o non leggibile: verrà ignorato.');
-            }
-        } elseif ($resume) {
-            $io->warning('Nessun checkpoint trovato: elaborazione partirà da zero.');
-        }
-
-        // --- Esecuzione principale ---
-        try {
-            $result = $this->processor->run($io, $dryRun, $resume, $limit);
-        } catch (\Throwable $e) {
-            $io->error('Errore durante l’esecuzione: ' . $e->getMessage());
+        if (!$csvPath || !file_exists($csvPath)) {
+            $io->error("CSV non trovato o non valido: $csvPath");
             return Command::FAILURE;
         }
 
-        $io->newLine(2);
-        $io->success(sprintf(
-            'Completato: %d file processati su %d totali in %s',
-            $result['processed'],
-            $result['total'],
-            $result['duration']
-        ));
-
-        // --- Post-run: mostra stato checkpoint finale ---
-        if ($fs->exists($checkpointFile)) {
-            $data = json_decode(file_get_contents($checkpointFile), true);
-            if (!empty($data['last_group'])) {
-                $io->text(sprintf('Checkpoint aggiornato: ultimo gruppo = %s', $data['last_group']));
+        if (!$autoYes) {
+            if (!$io->confirm('Procedere?', false)) {
+                $io->warning('Operazione annullata.');
+                return Command::SUCCESS;
             }
         }
 
-        if ($dryRun) {
-            $io->note('Esecuzione in modalità DRY-RUN: nessun file modificato.');
-        }
+        // Stima gruppi (progress bar)
+        $io->text('Stima numero gruppi…');
+        $total = $this->processor->estimateTotalGroups($batch, $tipo, $tavolePattern);
+        if ($limit > 0 && $limit < $total) $total = $limit;
+
+        $progress = $io->createProgressBar(max(1, $total));
+        $progress->setFormat(' [%bar%] %current%/%max% (%percent:3s%%) ETA: %estimated:-6s% ');
+        $progress->start();
+
+        $startAll = microtime(true);
+
+        // 👉 Passiamo solo il path, non l’array
+        $this->processor->process(
+            csvPath:        $csvPath,
+            magickPath:     $magickPath,
+            checkpointPath: $checkpoint,
+            outputBase:     $outputBase,
+            sourceBase:     $sourceBase,
+            tavoleBase:     $tavoleBase,
+            tavolePattern:  $tavolePattern,
+            planimetrie:    $planimVals,
+            suffixTitolo:   $suffixTitolo,
+            dryRun:         $dryRun,
+            resume:         $resume,
+            limitGroups:    $limit > 0 ? $limit : null,
+            batchFilter:    $batch,
+            tipoFilter:     $tipo,
+            progress:       $progress,
+            io:             $io,
+        );
+
+        $progress->finish();
+        $io->newLine(2);
+        $io->success(sprintf('Completato in %.2f sec.', microtime(true) - $startAll));
 
         return Command::SUCCESS;
     }
