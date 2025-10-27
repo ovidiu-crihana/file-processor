@@ -58,24 +58,33 @@ final class FileOperations
         $tifTmp   = $tmpBase . DIRECTORY_SEPARATOR . $uid . '.tif';
         $pdfTmp   = $tmpBase . DIRECTORY_SEPARATOR . $uid . '.pdf';
 
-        file_put_contents($listFile, implode(PHP_EOL, array_values($existing)));
-
-        // Limiti e opzioni IM
         $memLimit = $_ENV['IMAGEMAGICK_MEMORY_LIMIT'] ?? '1GiB';
         $mapLimit = $_ENV['IMAGEMAGICK_MAP_LIMIT']    ?? '2GiB';
         $thrLimit = (int)($_ENV['IMAGEMAGICK_THREAD_LIMIT'] ?? 1);
         $tmpDirIM = $tmpBase;
+
+        $fileListStr = implode(' ', array_map(
+            static fn($f) => '"' . $f . '"',
+            $existing
+        ));
 
         try {
             // Merge TIFF multipagina (Group4 per BN; rows-per-strip aiuta memoria)
             $cmdTif = sprintf(
                 '"%s" -limit memory %s -limit map %s -limit thread %d ' .
                 '-define registry:temporary-path="%s" ' .
-                '@%s -compress Group4 -strip -define tiff:rows-per-strip=64K "%s"',
+                '%s -compress Group4 -strip -define tiff:rows-per-strip=64K "%s"',
                 $magickPath, $memLimit, $mapLimit, $thrLimit, $tmpDirIM,
-                $listFile, $tifTmp
+                $fileListStr, $tifTmp
             );
-            $this->runCommand($cmdTif, 'merge-tiff');
+            $args = array_merge(
+                ['-limit', 'memory', $memLimit, '-limit', 'map', $mapLimit, '-limit', 'thread', (string)$thrLimit],
+                ['-define', "registry:temporary-path={$tmpDirIM}"],
+                array_map(static fn($f) => $f, $existing),
+                ['-compress', 'Group4', '-strip', '-define', 'tiff:rows-per-strip=64K', $tifTmp]
+            );
+            $this->runCommand($magickPath, 'merge-tif', $args);
+
 
             // TIFF → PDF
             $cmdPdf = sprintf(
@@ -104,10 +113,16 @@ final class FileOperations
     /**
      * Esegue un comando shell e lancia eccezione in caso di errore.
      */
-    private function runCommand(string $cmd, string $label): void
+    private function runCommand(string $cmdOrPath, string $label, ?array $args = null): void
     {
-        $this->logger->debug("▶️  $label → $cmd");
-        $process = Process::fromShellCommandline($cmd);
+        if ($args) {
+            // Usa Process sicuro, niente shell
+            $process = new Process(array_merge([$cmdOrPath], $args));
+        } else {
+            // fallback vecchio (magari per debug singolo)
+            $process = Process::fromShellCommandline($cmdOrPath);
+        }
+
         $process->setTimeout(0);
         $process->run();
 
@@ -120,6 +135,7 @@ final class FileOperations
             ));
         }
     }
+
 
     // ============================================================
     //  FUNZIONI PER LE "TAVOLE" (COPY + PDF)
