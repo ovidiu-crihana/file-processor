@@ -14,7 +14,11 @@ final class FileOperations
 
     /**
      * Esegue il merge dei file TIFF e crea il PDF.
-     * Ritorna lo stato: OK / OK_PARTIAL / ERROR
+     * Tutte le operazioni pesanti avvengono su cartella temporanea locale
+     * per minimizzare RAM e I/O su rete.
+     *
+     * @param array<int,string> $tifFiles
+     * @return 'OK'|'OK_PARTIAL'|'ERROR'
      */
     public function mergeTiffGroup(
         array $tifFiles,
@@ -23,61 +27,86 @@ final class FileOperations
         string $magickPath
     ): string {
         $total = count($tifFiles);
-
         if ($total === 0) {
             $this->logger->warn("⚠️  Nessun file nel gruppo — merge saltato (simulazione).");
-            usleep(100000);
+            usleep(100_000);
             return 'OK_PARTIAL';
         }
 
-        // Filtra solo file esistenti
-        $existing = array_filter($tifFiles, fn($f) => file_exists($f));
+        // Filtra file esistenti
+        $existing = array_filter($tifFiles, fn($f) => is_string($f) && file_exists($f));
         $missingCount = $total - count($existing);
 
         if ($missingCount > 0) {
-            $this->logger->warn("⚠️  Mancano $missingCount file TIFF su $total — verranno ignorati.");
+            $this->logger->warn("⚠️  Mancano {$missingCount} file TIFF su {$total} — verranno ignorati.");
         }
 
-        // Se nessuno esiste → simulazione (utile in test locale)
         if (count($existing) === 0) {
             $this->logger->warn("⚠️  Nessun file esistente — simulazione merge vuoto.");
-            usleep(150000);
+            usleep(150_000);
             return 'OK_PARTIAL';
         }
 
-        $listFile = tempnam(sys_get_temp_dir(), 'merge_');
-        file_put_contents($listFile, implode(PHP_EOL, $existing));
+        // === Cartella temporanea locale ===
+        $tmpBase = rtrim((string)($_ENV['TEMP_PATH'] ?? sys_get_temp_dir()), "\\/");
+        if (!is_dir($tmpBase)) {
+            @mkdir($tmpBase, 0777, true);
+        }
 
-        $tifTmp = $tifOut . '.tmp.tif';
-        $pdfTmp = $pdfOut . '.tmp.pdf';
+        $uid      = uniqid('fp_', true);
+        $listFile = $tmpBase . DIRECTORY_SEPARATOR . $uid . '_list.txt';
+        $tifTmp   = $tmpBase . DIRECTORY_SEPARATOR . $uid . '.tif';
+        $pdfTmp   = $tmpBase . DIRECTORY_SEPARATOR . $uid . '.pdf';
+
+        file_put_contents($listFile, implode(PHP_EOL, array_values($existing)));
+
+        // Limiti e opzioni IM
+        $memLimit = $_ENV['IMAGEMAGICK_MEMORY_LIMIT'] ?? '1GiB';
+        $mapLimit = $_ENV['IMAGEMAGICK_MAP_LIMIT']    ?? '2GiB';
+        $thrLimit = (int)($_ENV['IMAGEMAGICK_THREAD_LIMIT'] ?? 1);
+        $tmpDirIM = $tmpBase;
 
         try {
-            // ✅ Merge TIFF (rimuoviamo il subcomando convert)
-            $cmdTif = sprintf('"%s" @%s -compress Group4 -strip -define tiff:rows-per-strip=64K "%s"', $magickPath, $listFile, $tifTmp);
-            $this->runCommand($cmdTif, 'merge-tif');
+            // Merge TIFF multipagina (Group4 per BN; rows-per-strip aiuta memoria)
+            $cmdTif = sprintf(
+                '"%s" -limit memory %s -limit map %s -limit thread %d ' .
+                '-define registry:temporary-path="%s" ' .
+                '@%s -compress Group4 -strip -define tiff:rows-per-strip=64K "%s"',
+                $magickPath, $memLimit, $mapLimit, $thrLimit, $tmpDirIM,
+                $listFile, $tifTmp
+            );
+            $this->runCommand($cmdTif, 'merge-tiff');
 
-            // ✅ Conversione PDF
-            $cmdPdf = sprintf('"%s" "%s" "%s"', $magickPath, $tifTmp, $pdfTmp);
+            // TIFF → PDF
+            $cmdPdf = sprintf(
+                '"%s" -limit memory %s -limit map %s -limit thread %d ' .
+                '-define registry:temporary-path="%s" "%s" "%s"',
+                $magickPath, $memLimit, $mapLimit, $thrLimit, $tmpDirIM,
+                $tifTmp, $pdfTmp
+            );
             $this->runCommand($cmdPdf, 'tiff2pdf');
 
-            // ✅ Sostituzione atomica
+            // Spostamento finale atomico verso la share
             $this->fs->rename($tifTmp, $tifOut, true);
             $this->fs->rename($pdfTmp, $pdfOut, true);
-
-            @unlink($listFile);
         } catch (\Throwable $e) {
             $this->logger->error("❌ Errore durante merge: " . $e->getMessage());
+            @unlink($tifTmp);
+            @unlink($pdfTmp);
             return 'ERROR';
+        } finally {
+            @unlink($listFile);
         }
 
         return $missingCount > 0 ? 'OK_PARTIAL' : 'OK';
     }
 
     /**
-     * Esegue un comando shell e solleva eccezione se fallisce
+     * Esegue un comando shell e lancia eccezione in caso di errore.
      */
     private function runCommand(string $cmd, string $label): void
     {
+        $this->logger->debug("▶️  $label → $cmd");
         $process = Process::fromShellCommandline($cmd);
         $process->setTimeout(0);
         $process->run();
@@ -93,15 +122,9 @@ final class FileOperations
     }
 
     // ============================================================
-    // 🆕 NUOVE FUNZIONI PER GESTIONE "TAVOLE" (COPY + PDF)
+    //  FUNZIONI PER LE "TAVOLE" (COPY + PDF)
     // ============================================================
 
-    /**
-     * Costruisce il path sorgente per le tavole.
-     * Esempio:
-     *  trigger = "abc123", immagine = "000001.tif"
-     *  → \\server\Work\Tavole\Importate\abc123_000001.tif
-     */
     public function buildTavolaSourcePath(string $triggerValue, string $imageName): string
     {
         $base = rtrim((string)($_ENV['TAVOLE_BASE_PATH'] ?? ''), "\\/");
@@ -109,9 +132,6 @@ final class FileOperations
         return $base . DIRECTORY_SEPARATOR . $filename;
     }
 
-    /**
-     * Copia un file (creando la cartella destinazione se necessario)
-     */
     public function copyFile(string $src, string $dst): bool
     {
         try {
@@ -123,6 +143,12 @@ final class FileOperations
             if (!file_exists($src)) {
                 $this->logger->warn("⚠️  File sorgente non trovato: $src");
                 return false;
+            }
+
+            // Usa SafeFilesystem per coerenza (se implementa copy/rename atomica)
+            if (method_exists($this->fs, 'copy')) {
+                $this->fs->copy($src, $dst, true);
+                return true;
             }
 
             if (!@copy($src, $dst)) {
@@ -138,23 +164,34 @@ final class FileOperations
     }
 
     /**
-     * Conversione TIFF → PDF per singolo file (usata dalle tavole)
+     * Conversione singolo TIFF → PDF (usata per le tavole).
+     * Usa i limiti di memoria configurabili e staging locale.
      */
     public function convertSingleTiffToPdf(string $srcTif, string $dstPdf): bool
     {
-        $magickPath = $_ENV['MAGICK_PATH'] ?? 'magick';
-        $dir = dirname($dstPdf);
-        if (!is_dir($dir)) {
-            @mkdir($dir, 0777, true);
-        }
-
+        $magickPath = $_ENV['IMAGEMAGICK_PATH'] ?? ($_ENV['MAGICK_PATH'] ?? 'magick');
         if (!file_exists($srcTif)) {
             $this->logger->warn("⚠️  File TIFF sorgente mancante per conversione: $srcTif");
             return false;
         }
 
-        $pdfTmp = $dstPdf . '.tmp.pdf';
-        $cmd = sprintf('"%s" "%s" "%s"', $magickPath, $srcTif, $pdfTmp);
+        $dir = dirname($dstPdf);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0777, true);
+        }
+
+        $tmpBase = rtrim((string)($_ENV['TEMP_PATH'] ?? sys_get_temp_dir()), "\\/");
+        $pdfTmp  = $tmpBase . DIRECTORY_SEPARATOR . uniqid('fp_', true) . '.pdf';
+
+        $memLimit = $_ENV['IMAGEMAGICK_MEMORY_LIMIT'] ?? '512MiB';
+        $mapLimit = $_ENV['IMAGEMAGICK_MAP_LIMIT']    ?? '1GiB';
+        $thrLimit = (int)($_ENV['IMAGEMAGICK_THREAD_LIMIT'] ?? 1);
+
+        $cmd = sprintf(
+            '"%s" -limit memory %s -limit map %s -limit thread %d ' .
+            '-define registry:temporary-path="%s" "%s" "%s"',
+            $magickPath, $memLimit, $mapLimit, $thrLimit, $tmpBase, $srcTif, $pdfTmp
+        );
 
         try {
             $this->runCommand($cmd, 'tiff2pdf-single');
@@ -162,14 +199,11 @@ final class FileOperations
             return true;
         } catch (\Throwable $e) {
             $this->logger->error("❌ Errore durante conversione singolo TIFF→PDF: " . $e->getMessage());
+            @unlink($pdfTmp);
             return false;
         }
     }
 
-    /**
-     * Utility già presente nel progetto (riconfermata):
-     * Costruisce il path completo di output (Output\TIFF|PDF\{n_cartella}\{filename})
-     */
     public function buildOutputPath(string $type, int $folderIndex, string $filename): string
     {
         $base = rtrim($_ENV['OUTPUT_BASE_PATH'] ?? '', "\\/");

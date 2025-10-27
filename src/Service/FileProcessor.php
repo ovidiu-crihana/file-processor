@@ -36,7 +36,7 @@ final class FileProcessor
         $resumeSkip = array_filter(array_map(
             'strtoupper',
             array_map('trim', explode(',', $_ENV['RESUME_SKIP_STATUSES'] ?? 'OK'))
-        ));
+        )) ?: ['OK'];
 
         // Checkpoint (mappa chiave => STATUS)
         $done = $this->loadCheckpointMap($checkpoint);
@@ -90,17 +90,17 @@ final class FileProcessor
         };
 
         $resolveStandardSource = function(array $row) use ($sourceBase) {
-            $nome = trim($row['IMMAGINE'] ?? '');
+            $nome  = trim($row['IMMAGINE'] ?? '');
             $batch = trim($row['BATCH'] ?? '');
             $tsStr = trim($row['DATA_ORA_ACQ'] ?? '');
-            $ts = strtotime($tsStr);
+            $ts    = strtotime($tsStr);
             if (!$ts) return "[INVALID_DATE]\\{$nome}";
             $yyyy = date('Y', $ts); $mm = date('m', $ts); $dd = date('d', $ts);
             return "{$sourceBase}\\{$yyyy}\\{$mm}\\{$dd}\\{$batch}\\{$nome}";
         };
 
         $extractTavolaSuffix = function (string $image): string {
-            $base = pathinfo($image, PATHINFO_FILENAME);
+            $base  = pathinfo($image, PATHINFO_FILENAME);
             $parts = explode('_', $base);
             return end($parts) ?: $base;
         };
@@ -109,7 +109,7 @@ final class FileProcessor
         $flushStandard = function() use (
             &$groupRows, &$groupFiles, &$folderNum, &$groupsDone, &$groupsStandardCount,
             $folderOffset, $outputBase, $buildOutputBase, $resume, $resumeSkip, $done, $dryRun,
-            $magickPath, $checkpoint, $io, $tavolePdfEnabled
+            $magickPath, $checkpoint, $io
         ) {
             if (empty($groupRows)) return;
 
@@ -144,26 +144,26 @@ final class FileProcessor
             }
 
             // Conteggio file
-            $total = count($groupFiles);
+            $total  = count($groupFiles);
             $foundFiles = array_values(array_filter($groupFiles, 'is_file'));
-            $found = count($foundFiles);
+            $found  = count($foundFiles);
             $missing = max(0, $total - $found);
 
             // Log inizio
             $this->log->logGroupStart($io, [
-                'folderNum'   => $numStr,
-                'groupName'   => $baseName,
-                'batch'       => $batch,
-                'tipo'        => $tipo,
-                'idDoc'       => (int)$iddoc,
-                'isTavola'    => false,
-                'isTitolo'    => (bool)preg_match('/TITOLO_AUTORIZZATIVO/i', $tipo),
-                'totalFiles'  => $total,
-                'foundFiles'  => $found,
-                'missingFiles'=> $missing,
-                'tifOut'      => $tifOut,
-                'pdfOut'      => $pdfOut,
-                'pdfEnabled'  => true, // sempre true per gruppi standard
+                'folderNum'    => $numStr,
+                'groupName'    => $baseName,
+                'batch'        => $batch,
+                'tipo'         => $tipo,
+                'idDoc'        => (int)$iddoc,
+                'isTavola'     => false,
+                'isTitolo'     => (bool)preg_match('/TITOLO_AUTORIZZATIVO/i', $tipo),
+                'totalFiles'   => $total,
+                'foundFiles'   => $found,
+                'missingFiles' => $missing,
+                'tifOut'       => $tifOut,
+                'pdfOut'       => $pdfOut,
+                'pdfEnabled'   => true,
             ]);
 
             $t0 = microtime(true);
@@ -171,12 +171,13 @@ final class FileProcessor
 
             try {
                 if ($dryRun) {
-                    usleep(100000 + $total * 3000);
+                    usleep(100_000 + $total * 3_000);
                 } else {
                     if ($found === 0) {
-                        $status = 'OK_PARTIAL'; // tutti mancanti → partial (coerente con debug)
+                        $status = 'OK_PARTIAL'; // tutti mancanti → partial
                     } else {
-                        $status = $this->ops->mergeTiffGroup($foundFiles, $tifOut, $pdfOut, $magickPath);
+                        // 👉 merge ottimizzato (staging locale + limiti IM)
+                        $status = $this->ops->mergeTiffGroup($foundFiles, $tifOut, $pdfOut, $_ENV['IMAGEMAGICK_PATH'] ?? $magickPath);
                     }
                 }
             } catch (\Throwable $e) {
@@ -184,7 +185,6 @@ final class FileProcessor
                 $io->writeln('<fg=red>❌ Eccezione durante merge: ' . $e->getMessage() . '</>');
             }
 
-            // Se merge OK ma c'erano mancanti → OK_PARTIAL
             if ($status === 'OK' && $missing > 0) {
                 $status = 'OK_PARTIAL';
             }
@@ -265,23 +265,23 @@ final class FileProcessor
 
                     // Log inizio, stile unificato
                     $this->log->logGroupStart($io, [
-                        'folderNum'   => $numStr,
-                        'groupName'   => "[TAVOLA] {$base}",
-                        'batch'       => $batch,
-                        'tipo'        => $tipo,
-                        'idDoc'       => (int)$iddoc,
-                        'isTavola'    => true,
-                        'isTitolo'    => false,
-                        'totalFiles'  => $total,
-                        'foundFiles'  => $found,
-                        'missingFiles'=> $missing,
-                        'srcFile'     => $src,
-                        'tifOut'      => $tifOut,
-                        'pdfOut'      => $pdfOut,
-                        'pdfEnabled'  => $tavolePdfEnabled,
+                        'folderNum'    => $numStr,
+                        'groupName'    => "[TAVOLA] {$base}",
+                        'batch'        => $batch,
+                        'tipo'         => $tipo,
+                        'idDoc'        => (int)$iddoc,
+                        'isTavola'     => true,
+                        'isTitolo'     => false,
+                        'totalFiles'   => $total,
+                        'foundFiles'   => $found,
+                        'missingFiles' => $missing,
+                        'srcFile'      => $src,
+                        'tifOut'       => $tifOut,
+                        'pdfOut'       => $pdfOut,
+                        'pdfEnabled'   => $tavolePdfEnabled,
                     ]);
 
-                    // Resume: usiamo chiave estesa per tavole (includendo l'immagine)
+                    // Resume: chiave estesa per tavole (includendo l'immagine)
                     $ckey = "{$batch}|{$iddoc}|{$tipo}|{$imm}";
                     $prev = $done[$ckey] ?? null;
                     $prevNorm = $prev ? strtoupper(trim((string)$prev)) : null;
@@ -303,34 +303,29 @@ final class FileProcessor
                     $t0 = microtime(true);
                     $status = 'OK';
                     if ($dryRun) {
-                        usleep(50000);
-                        // in dry-run manteniamo lo stato coerente coi presenti/mancanti
+                        usleep(50_000);
                         $status = ($missing > 0) ? 'OK_PARTIAL' : 'OK';
                     } else {
                         if ($found === 0) {
-                            // Richiesta: OK_PARTIAL anche per tavole quando il sorgente è mancante
                             $status = 'OK_PARTIAL';
                         } else {
-                            // copia con overwrite
-                            if (!@copy($src, $tifOut)) {
+                            // copia con filesystem "sicuro"
+                            $copied = $this->ops->copyFile($src, $tifOut);
+                            if (!$copied) {
                                 $status = 'ERROR';
                             } else {
                                 if ($tavolePdfEnabled) {
-                                    $p = Process::fromShellCommandline(sprintf('"%s" "%s" "%s"', $magickPath, $tifOut, $pdfOut));
-                                    $p->setTimeout(0);
-                                    $p->run();
-                                    if (!$p->isSuccessful()) {
-                                        // pdf fallito: warning, ma lo stato resta OK/OK_PARTIAL in base ai mancanti
-                                        $io->writeln('<fg=yellow>⚠️  PDF tavola non creato: ' . trim($p->getErrorOutput() ?: $p->getOutput()) . '</>');
+                                    // 👉 conversione con limiti e temp locale
+                                    $conv = $this->convertTavolaWithLimits($tifOut, $pdfOut, $_ENV['IMAGEMAGICK_PATH'] ?? $magickPath);
+                                    if ($conv !== 'OK') {
+                                        $io->writeln('<fg=yellow>⚠️  PDF tavola non creato (conversione fallita)</>');
                                     }
                                 }
-                                // se il TIFF è ok ma c'erano mancanti (non qui, total=1) → mantenere eventuale partial
                             }
                         }
                     }
                     $dt = microtime(true) - $t0;
 
-                    // Stato finale coerente con richiesta: OK solo se tutto presente/eseguito
                     if ($status === 'OK' && $missing > 0) {
                         $status = 'OK_PARTIAL';
                     }
@@ -392,8 +387,39 @@ final class FileProcessor
         $io->success('Processo completato.');
     }
 
+    /**
+     * Conversione singola per le Tavole (TIFF → PDF) con limiti IM e temp locale.
+     *
+     * @return 'OK'|'ERROR'
+     */
+    private function convertTavolaWithLimits(string $tifPath, string $pdfPath, string $magickPath): string
+    {
+        $memLimit = $_ENV['IMAGEMAGICK_MEMORY_LIMIT'] ?? '512MiB';
+        $mapLimit = $_ENV['IMAGEMAGICK_MAP_LIMIT']    ?? '1GiB';
+        $thrLimit = (int)($_ENV['IMAGEMAGICK_THREAD_LIMIT'] ?? 1);
+        $tmpDirIM = rtrim((string)($_ENV['TEMP_PATH'] ?? sys_get_temp_dir()), "\\/");
+
+        $cmd = sprintf(
+            '"%s" -limit memory %s -limit map %s -limit thread %d ' .
+            '-define registry:temporary-path="%s" "%s" "%s"',
+            $magickPath, $memLimit, $mapLimit, $thrLimit, $tmpDirIM, $tifPath, $pdfPath
+        );
+
+        $p = Process::fromShellCommandline($cmd);
+        $p->setTimeout(0);
+        $p->run();
+
+        if (!$p->isSuccessful()) {
+            $this->log->error("Errore tavola $tifPath → $pdfPath: " . trim($p->getErrorOutput() ?: $p->getOutput()));
+            return 'ERROR';
+        }
+
+        return 'OK';
+    }
+
     // ===================== Checkpoint compatibile =====================
 
+    /** @return array<string,string> */
     private function loadCheckpointMap(string $path): array
     {
         $map = [];
@@ -406,7 +432,8 @@ final class FileProcessor
         fgetcsv($f);
         while (($r = fgetcsv($f)) !== false) {
             if (count($r) < 6) continue;
-            [$b, $i, $t, $folder, $status] = $r; // compat con file esistente (5 colonne lette)
+            // compat precedente: 5 colonne lette nell'uso, ma il file ne ha 6
+            [$b, $i, $t, $folder, $status] = $r; // legacy: ignora UPDATED_AT
             $key = trim($b) . '|' . trim((string)$i) . '|' . trim($t);
             $map[$key] = trim((string)$status);
         }
