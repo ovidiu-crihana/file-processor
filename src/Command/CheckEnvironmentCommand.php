@@ -4,6 +4,7 @@ namespace App\Command;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Style\SymfonyStyle;
 use Symfony\Component\Filesystem\Filesystem;
@@ -11,7 +12,7 @@ use Symfony\Component\Filesystem\Filesystem;
 /**
  * 🔍 Controlla e mostra lo stato completo dell'ambiente di esecuzione
  * - Verifica variabili .env principali
- * - Testa presenza, leggibilità e scrivibilità dei percorsi
+ * - Testa presenza, leggibilità e scrivibilità dei percorsi (anche UNC)
  * - Mostra utente corrente e versione ImageMagick
  */
 #[AsCommand(
@@ -28,9 +29,22 @@ class CheckEnvironmentCommand extends Command
         $this->fs = new Filesystem();
     }
 
+    protected function configure(): void
+    {
+        $this->addOption(
+            'deep',
+            null,
+            InputOption::VALUE_NONE,
+            'Mostra dettagli tecnici aggiuntivi su errori e permessi'
+        );
+    }
+
+
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
         $io = new SymfonyStyle($input, $output);
+        $verbose = $input->getOption('deep');
+
         $io->title('🔍 Verifica ambiente File Processor');
 
         $rows = [];
@@ -38,12 +52,12 @@ class CheckEnvironmentCommand extends Command
         $warnings = 0;
         $errors = 0;
 
-        // Mostra utente corrente
+        // 👤 Mostra utente corrente
         $user = trim(shell_exec('whoami')) ?: '(sconosciuto)';
         $io->text("👤 Utente corrente: <fg=cyan>{$user}</>");
         $io->newLine();
 
-        // Variabili
+        // --- Variabili principali
         $source = $_ENV['SOURCE_BASE_PATH'] ?? '';
         $outputPath = $_ENV['OUTPUT_BASE_PATH'] ?? '';
         $tavole = $_ENV['TAVOLE_BASE_PATH'] ?? '';
@@ -52,18 +66,18 @@ class CheckEnvironmentCommand extends Command
 
         $rows[] = ['PHP version', phpversion(), '✅ OK']; $ok++;
 
-        // Controllo percorsi
-        $rows[] = $this->analyzePath('SOURCE_BASE_PATH', $source, true, false, $ok, $warnings, $errors);
-        $rows[] = $this->analyzePath('OUTPUT_BASE_PATH', $outputPath, true, true, $ok, $warnings, $errors);
-        $rows[] = $this->analyzePath('TAVOLE_BASE_PATH', $tavole, true, false, $ok, $warnings, $errors);
-        $rows[] = $this->checkCsv($csv, $ok, $warnings, $errors);
-        $rows[] = $this->checkMagick($magick, $ok, $warnings, $errors);
+        // Percorsi principali
+        $rows[] = $this->analyzePath('SOURCE_BASE_PATH', $source, true, false, $ok, $warnings, $errors, $user, $verbose, $io);
+        $rows[] = $this->analyzePath('OUTPUT_BASE_PATH', $outputPath, true, true, $ok, $warnings, $errors, $user, $verbose, $io);
+        $rows[] = $this->analyzePath('TAVOLE_BASE_PATH', $tavole, true, false, $ok, $warnings, $errors, $user, $verbose, $io);
+        $rows[] = $this->checkCsv($csv, $ok, $warnings, $errors, $verbose, $io);
+        $rows[] = $this->checkMagick($magick, $ok, $warnings, $errors, $verbose, $io);
 
-        // Tabella risultati
+        // Tabella principale
         $io->section('Variabili ambiente principali');
         $io->table(['Variabile', 'Valore', 'Esito'], $rows);
 
-        // Riepilogo
+        // Riepilogo finale
         $io->section('📋 Sintesi');
         $io->listing([
             "✅ OK: {$ok}",
@@ -71,7 +85,6 @@ class CheckEnvironmentCommand extends Command
             $errors > 0 ? "❌ Errori: {$errors}" : null,
         ]);
 
-        $io->newLine();
         if ($errors === 0) {
             $io->success('✅ Tutti i controlli principali superati. Ambiente pronto.');
             return Command::SUCCESS;
@@ -82,7 +95,7 @@ class CheckEnvironmentCommand extends Command
     }
 
     // -------------------------------------------------------------------------
-    // 🔧 Metodi di analisi
+    // 🔧 PATH CHECKS
 
     private function analyzePath(
         string $name,
@@ -91,7 +104,10 @@ class CheckEnvironmentCommand extends Command
         bool $mustBeWritable,
         int &$ok,
         int &$warnings,
-        int &$errors
+        int &$errors,
+        string $user,
+        bool $verbose,
+        SymfonyStyle $io
     ): array {
         if (!$path) {
             $errors++;
@@ -103,13 +119,20 @@ class CheckEnvironmentCommand extends Command
 
         if (!$exists) {
             $errors++;
+            if ($verbose) {
+                $io->writeln("<fg=red>[VERBOSE]</> Path non trovato: {$resolved}");
+                $io->writeln("Possibili cause: share SMB non montata, permessi negati o path errato.\n");
+            }
             return [$name, $resolved, '❌ Non trovato (path inesistente o share non montata)'];
         }
 
-        // Controllo permessi
+        // Lettura e scrittura
         $readable = is_readable($resolved);
         $canWrite = false;
         $tmpFile = null;
+        $details = [];
+
+        if ($readable) $details[] = 'leggibile';
 
         if ($mustBeWritable && $readable) {
             try {
@@ -118,8 +141,10 @@ class CheckEnvironmentCommand extends Command
                     file_put_contents($tmpFile, 'test');
                     $canWrite = true;
                 }
-            } catch (\Throwable) {
-                $canWrite = false;
+            } catch (\Throwable $e) {
+                if ($verbose) {
+                    $io->writeln("<fg=red>[VERBOSE]</> Scrittura fallita su {$resolved}: " . $e->getMessage());
+                }
             } finally {
                 if ($tmpFile && file_exists($tmpFile)) @unlink($tmpFile);
             }
@@ -127,20 +152,21 @@ class CheckEnvironmentCommand extends Command
 
         if (!$readable) {
             $errors++;
-            return [$name, $resolved, '❌ Non leggibile (permessi negati o share non accessibile)'];
+            return [$name, $resolved, "❌ Non leggibile (permessi negati all’utente {$user})"];
         }
 
         if ($mustBeWritable && !$canWrite) {
             $warnings++;
-            return [$name, $resolved, '⚠️ Non scrivibile (verificare permessi o blocco file system)'];
+            return [$name, $resolved, "⚠️ Non scrivibile (Access denied for {$user})"];
         }
 
         $ok++;
-        $permText = $mustBeWritable ? 'leggibile + scrivibile' : 'leggibile';
+        $permText = implode(' + ', $details);
+        if ($mustBeWritable) $permText .= ' + scrivibile';
         return [$name, "{$resolved} ({$permText})", '✅ OK'];
     }
 
-    private function checkCsv(string $csv, int &$ok, int &$warnings, int &$errors): array
+    private function checkCsv(string $csv, int &$ok, int &$warnings, int &$errors, bool $verbose, SymfonyStyle $io): array
     {
         if (!$csv) {
             $errors++;
@@ -156,6 +182,9 @@ class CheckEnvironmentCommand extends Command
 
         if (!is_file($resolved)) {
             $errors++;
+            if ($verbose) {
+                $io->writeln("<fg=red>[VERBOSE]</> File CSV non trovato: {$resolved}");
+            }
             return ['CSV_PATH', $resolved, '❌ File CSV non trovato'];
         }
 
@@ -169,17 +198,23 @@ class CheckEnvironmentCommand extends Command
         return ['CSV_PATH', "{$resolved} ({$sizeMb} MB, leggibile)", '✅ OK'];
     }
 
-    private function checkMagick(string $magick, int &$ok, int &$warnings, int &$errors): array
+    private function checkMagick(string $magick, int &$ok, int &$warnings, int &$errors, bool $verbose, SymfonyStyle $io): array
     {
-        @exec("\"{$magick}\" -version", $out, $code);
+        @exec("\"{$magick}\" -version 2>&1", $out, $code);
         if ($code !== 0 || empty($out)) {
             $errors++;
+            if ($verbose) {
+                $io->writeln("<fg=red>[VERBOSE]</> Impossibile eseguire '{$magick} -version' (codice {$code})");
+            }
             return ['ImageMagick', $magick, '❌ Non trovato o non eseguibile'];
         }
 
         $version = trim($out[0]);
         if (stripos($version, 'ImageMagick') === false) {
             $warnings++;
+            if ($verbose) {
+                $io->writeln("<fg=yellow>[VERBOSE]</> Output inatteso da ImageMagick: {$version}");
+            }
             return ['ImageMagick', $version, '⚠️ Output sconosciuto'];
         }
 

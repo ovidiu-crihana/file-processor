@@ -13,7 +13,7 @@ use Symfony\Component\Console\Style\SymfonyStyle;
 
 #[AsCommand(
     name: 'app:process-files',
-    description: 'Esegue l’elaborazione effettiva dei gruppi (TIFF → PDF) con resume e checkpoint'
+    description: 'Esegue il processo reale: merge gruppi standard e copy+PDF per tavole'
 )]
 final class ProcessFilesCommand extends Command
 {
@@ -26,81 +26,83 @@ final class ProcessFilesCommand extends Command
     protected function configure(): void
     {
         $this
-            ->addOption('dry-run', null, InputOption::VALUE_NONE, 'Simula senza generare i file')
-            ->addOption('resume', null, InputOption::VALUE_NONE, 'Riprende da checkpoint esistente')
-            ->addOption('limit', null, InputOption::VALUE_REQUIRED, 'Numero massimo di gruppi da elaborare', 0)
-            ->addOption('batch', null, InputOption::VALUE_REQUIRED, 'Filtra per batch specifico')
-            ->addOption('tipo', null, InputOption::VALUE_REQUIRED, 'Filtra per tipo documento specifico')
-            ->addOption('yes', 'y', InputOption::VALUE_NONE, 'Salta la conferma interattiva');
+            ->addOption('batch',    null, InputOption::VALUE_REQUIRED, 'Filtra per BATCH specifico', null)
+            ->addOption('limit',    null, InputOption::VALUE_REQUIRED, 'Limita il numero di gruppi da processare (0=tutti)', '0')
+            ->addOption('max-rows', null, InputOption::VALUE_REQUIRED, 'Leggi massimo N righe dal CSV (0=tutte)', '0')
+            ->addOption('dry-run',  null, InputOption::VALUE_NONE,     'Simula senza scrivere su disco')
+            ->addOption('resume',   null, InputOption::VALUE_NONE,     'Salta i gruppi in checkpoint con stati da RESUME_SKIP_STATUSES')
+            ->addOption('yes',      'y',  InputOption::VALUE_NONE,     'Salta la conferma iniziale');
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $io         = new SymfonyStyle($input, $output);
-        $resume     = (bool)$input->getOption('resume');
-        $dryRun     = (bool)$input->getOption('dry-run');
-        $limit      = (int)$input->getOption('limit');
-        $batch      = $input->getOption('batch');
-        $tipo       = $input->getOption('tipo');
-        $autoYes    = (bool)$input->getOption('yes');
+        $io      = new SymfonyStyle($input, $output);
 
-        $io->title('Elaborazione gruppi');
+        $csvPath     = $_ENV['CSV_PATH'] ?? '';
+        $outputBase  = rtrim($_ENV['OUTPUT_BASE_PATH'] ?? '', '\\/');
+        $sourceBase  = rtrim($_ENV['SOURCE_BASE_PATH'] ?? '', '\\/');
+        $tavoleBase  = rtrim($_ENV['TAVOLE_BASE_PATH'] ?? 'Work\\Tavole\\Importate', '\\/');
+        $triggerRx   = $_ENV['TAVOLE_TRIGGER_PATTERN'] ?? '^[A-Za-z0-9]+\\.$';
+        $patternEnv  = str_replace('{SUFFISSO}', '', $_ENV['OUTPUT_FILENAME_PATTERN'] ?? '{TIPO_PRATICA}_{PRAT_NUM}_{ANNO}_{TIPO_DOCUMENTO}.{EXT}');
+        $checkpoint  = $_ENV['CHECKPOINT_FILE'] ?? 'var/checkpoints/process.csv';
+        $magickPath  = $_ENV['IMAGEMAGICK_PATH'] ?? 'magick';
 
-        // Parametri principali
-        $csvPath       = $_ENV['CSV_PATH'] ?? null;
-        $magickPath    = $_ENV['IMAGEMAGICK_PATH'] ?? 'magick';
-        $checkpoint    = $_ENV['CHECKPOINT_FILE'] ?? 'var/logs/checkpoint.csv';
-        $outputBase    = rtrim($_ENV['OUTPUT_BASE_PATH'] ?? 'Output', '\\/');
-        $sourceBase    = rtrim($_ENV['SOURCE_BASE_PATH'] ?? 'Work', '\\/');
-        $tavoleBase    = rtrim($_ENV['TAVOLE_BASE_PATH'] ?? 'Work\\Tavole\\Importate', '\\/');
-        $tavolePattern = $_ENV['TAVOLE_TRIGGER_PATTERN'] ?? '^[A-Za-z0-9]+\\.?$';
-        $planimVals    = array_filter(array_map('trim', explode(';', $_ENV['TAVOLE_PLANIMETRIE_VALUES'] ?? 'ELABORATO_GRAFICO')));
-
-        if (!$csvPath || !file_exists($csvPath)) {
-            $io->error("CSV non trovato o non valido: $csvPath");
+        if (!$csvPath || !is_file($csvPath)) {
+            $io->error('CSV_PATH non impostato o file non trovato.');
+            return Command::FAILURE;
+        }
+        if (!$outputBase) {
+            $io->error('OUTPUT_BASE_PATH non impostato.');
             return Command::FAILURE;
         }
 
+        $batch      = $input->getOption('batch') ?: null;
+        $limit      = max(0, (int)$input->getOption('limit'));
+        $maxRows    = max(0, (int)$input->getOption('max-rows'));
+        $dryRun     = (bool)$input->getOption('dry-run');
+        $resume     = (bool)$input->getOption('resume');
+        $autoYes    = (bool)$input->getOption('yes');
+
+        $io->title('Processo reale — merge/copy');
+
+        $io->listing([
+            "CSV: {$csvPath}",
+            "Output base: {$outputBase}",
+            "Filtro batch: " . ($batch ?: '[tutti]'),
+            "Limit gruppi: " . ($limit ?: 'no'),
+            "Max rows: "     . ($maxRows ?: 'tutte'),
+            "Dry-run: "      . ($dryRun ? 'sì' : 'no'),
+            "Resume: "       . ($resume ? 'sì' : 'no'),
+        ]);
+
         if (!$autoYes) {
-            if (!$io->confirm('Procedere?', false)) {
+            if (!$io->confirm('Confermi di avviare il processo con queste impostazioni?', false)) {
                 $io->warning('Operazione annullata.');
                 return Command::SUCCESS;
             }
         }
 
-        // Stima gruppi (progress bar)
-        $io->text('Stima numero gruppi…');
-        $total = $this->processor->estimateTotalGroups($batch, $tipo, $tavolePattern);
-        if ($limit > 0 && $limit < $total) $total = $limit;
-
-        $progress = $io->createProgressBar(max(1, $total));
-        $progress->setFormat(' [%bar%] %current%/%max% (%percent:3s%%) ETA: %estimated:-6s% ');
-        $progress->start();
-
-        $startAll = microtime(true);
-
-        // 👉 Passiamo solo il path, non l’array
-        $this->processor->process(
-            csvPath:        $csvPath,
-            magickPath:     $magickPath,
-            checkpointPath: $checkpoint,
-            outputBase:     $outputBase,
-            sourceBase:     $sourceBase,
-            tavoleBase:     $tavoleBase,
-            tavolePattern:  $tavolePattern,
-            planimetrie:    $planimVals,
-            dryRun:         $dryRun,
-            resume:         $resume,
-            limitGroups:    $limit > 0 ? $limit : null,
-            batchFilter:    $batch,
-            tipoFilter:     $tipo,
-            progress:       $progress,
-            io:             $io,
-        );
-
-        $progress->finish();
-        $io->newLine(2);
-        $io->success(sprintf('Completato in %.2f sec.', microtime(true) - $startAll));
+        try {
+            $this->processor->process(
+                csvPath:      $csvPath,
+                magickPath:   $magickPath,
+                checkpoint:   $checkpoint,
+                outputBase:   $outputBase,
+                sourceBase:   $sourceBase,
+                tavoleBase:   $tavoleBase,
+                tavoleTrigger:$triggerRx,
+                patternEnv:   $patternEnv,
+                dryRun:       $dryRun,
+                resume:       $resume,
+                limitGroups:  $limit ?: null,
+                batchFilter:  $batch,
+                maxRows:      $maxRows,
+                io:           $io,
+            );
+        } catch (\Throwable $e) {
+            $io->error('Errore fatale: ' . $e->getMessage());
+            return Command::FAILURE;
+        }
 
         return Command::SUCCESS;
     }
