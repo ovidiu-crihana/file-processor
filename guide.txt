@@ -1,0 +1,50 @@
+Navigare con powershell nella cartella dello script.
+
+------------------------------------
+
+1 - Aggiornare il progetto:
+1. git pull origin (scarica le ultime modifiche del codice)
+2. composer install (installa eventuali dipendenze aggiornate)
+3. modifica file .env.local (modifica i parametri interessati)
+	- SOURCE_BASE_PATH (percorso cartella Work)
+	- OUTPUT_BASE_PATH (percorso cartella output - nas o locale)
+	- CSV_PATH (percorso al file .csv)
+	- TAVOLE_BASE_PATH (percorso alla cartella delle tavole)
+	- IMAGEMAGICK_PATH (percorso al file .exe di imagick)
+I path devono essere separati con due backslash (\\) mentre l'inizio del indirizzo IP del nas con quattro \\\\
+4. composer dump-env dev
+5. Creare se non esiste il file: /var/logs/file_processor.log
+
+------------------------------------
+
+2 - Verifica ambiente:
+- php bin/console app:check-environment
+
+------------------------------------
+
+3 - Simula processo
+- php bin/console app:debug-merge --summary (solo recap numerico)
+- php bin/console app:debug-merge --batch=X (nome del batch da simulare)
+- php bin/console app:debug-merge --limit=N (numero di gruppi da simulare. Gruppo = coppia batch + tipo_documento)
+- php bin/console app:debug-merge --max-rows=N (numero di righe a partire dalla prima da simulare)
+
+Per tutt i comandi è possibile specificare come output un file di log invece della console. Aggiungere --log alla fine del commando, esempio:
+- php bin/console app:debug-merge --summary --log
+- php bin/console app:debug-merge --batch=X --log
+- php bin/console app:debug-merge --limit=N --log
+- php bin/console app:debug-merge --max-rows=N --log
+
+Il file di log si trova in /var/logs/debug-merge.log
+
+------------------------------------
+
+4 - Esegui processo
+- php bin/console app:process-files (lancia intero processo)
+- php bin/console app:process-files --dry-run (lancia intero processo senza scrivere)
+- php bin/console app:process-files --limit=N (lancia intero processo per i primi N gruppi. Gruppo = coppia batch + tipo_documento)
+- php bin/console app:process-files --max-rows=N (lancia intero processo per le prime N righe)
+- php bin/console app:process-files --resume (riprende dall'ultimo gruppo in stato OK letto dal file di log)
+
+Le opzioni possono essere usate insieme, per esempio:
+- php bin/console app:process-files --dry-run --max-rows=100
+- php bin/console app:process-files --dry-run --batch=X
