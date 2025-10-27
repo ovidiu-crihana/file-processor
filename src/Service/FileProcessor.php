@@ -8,12 +8,14 @@ use Symfony\Component\Console\Style\SymfonyStyle;
 
 final class FileProcessor
 {
+    private bool $tavolePdfEnabled;
+
     public function __construct(
         private readonly LoggerService  $log,
         private readonly FileOperations $ops,
-
     )
     {
+        $this->tavolePdfEnabled = filter_var($_ENV['TAVOLE_PDF_ENABLED'] ?? 'true', FILTER_VALIDATE_BOOL);
     }
 
     /**
@@ -41,7 +43,7 @@ final class FileProcessor
             if ($batchFilter && $batch !== $batchFilter) continue;
             if ($tipoFilter && $tipo !== $tipoFilter) continue;
 
-            // trigger tavole (non corrette con pattern) → set prefix e continua
+            // trigger tavole
             if ($stato !== 'CORRETTO' && preg_match('/' . $tavolePattern . '/i', $tipo)) {
                 $prefix = $tipo;
                 continue;
@@ -56,6 +58,14 @@ final class FileProcessor
                 $groupKey = null;
                 $prefix = null;
             }
+
+            // 🆕 ogni riga di tavola ora è un gruppo autonomo
+            $isTavola = preg_match('/tavola|elaborato/i', $tipo);
+            if ($isTavola) {
+                $count++;
+                continue;
+            }
+
             if ($newGroupKey !== $groupKey) {
                 $groupKey = $newGroupKey;
                 $count++;
@@ -65,10 +75,7 @@ final class FileProcessor
     }
 
     /**
-     * Esecuzione reale in streaming.
-     * Numerazione cartelle: incrementa SOLO quando cambia (BATCH|IDDOCUMENTO).
-     * Chiusura/apertura gruppo: quando cambia (BATCH|TIPO_DOCUMENTO).
-     * Resume: salta gruppi con STATUS=OK in checkpoint; rielabora OK_PARTIAL/ERROR.
+     * Esecuzione reale in streaming
      */
     public function process(
         string       $csvPath,
@@ -79,7 +86,6 @@ final class FileProcessor
         string       $tavoleBase,
         string       $tavolePattern,
         array        $planimetrie,
-        string       $suffixTitolo,
         bool         $dryRun,
         bool         $resume,
         ?int         $limitGroups,
@@ -95,26 +101,21 @@ final class FileProcessor
         ));
 
         $done = $this->loadCheckpointMap($checkpointPath);
-
         if ($resume && count($done) > 0) {
-            // calcola davvero quelli che saranno saltati
             $toSkip = 0;
-            foreach ($done as $k => $st) {
+            foreach ($done as $st) {
                 if (in_array(strtoupper(trim((string)$st)), $skipStatuses, true)) {
                     $toSkip++;
                 }
             }
-
             $io->newLine();
             $io->writeln(sprintf(
-                "🔁 Modalità <fg=yellow>resume</> attiva — stati da saltare: <fg=yellow>%s</> — gruppi che verranno saltati: <fg=yellow>%d</>.",
+                "🔁 Modalità <fg=yellow>resume</> — stati da saltare: <fg=yellow>%s</> — gruppi saltati: <fg=yellow>%d</>.",
                 implode(', ', $skipStatuses),
                 $toSkip
             ));
             $lastKey = array_key_last($done);
-            if ($lastKey) {
-                $io->writeln("   ↳ Ultimo record checkpoint: <fg=gray>{$lastKey}</>");
-            }
+            if ($lastKey) $io->writeln("   ↳ Ultimo record checkpoint: <fg=gray>{$lastKey}</>");
             $io->newLine();
         }
 
@@ -126,7 +127,7 @@ final class FileProcessor
         $groupRows = [];
         $groupsDone = 0;
 
-        $flush = function () use (&$groupFiles, &$groupRows, &$folderNum, $outputBase, $suffixTitolo, $magickPath, $checkpointPath, $resume, $done, $dryRun, &$groupsDone, $progress, $io) {
+        $flush = function () use (&$groupFiles, &$groupRows, &$folderNum, $outputBase, $magickPath, $checkpointPath, $resume, $done, $dryRun, &$groupsDone, $progress, $io) {
             if (!$groupFiles || !$groupRows) return;
 
             $first = $groupRows[0];
@@ -142,25 +143,17 @@ final class FileProcessor
             ));
             $prevStatusNorm = $prevStatus ? strtoupper(trim((string)$prevStatus)) : null;
 
-            $io->writeln(sprintf(
-                "   · resume-check: prevStatus=%s, skipList=[%s], match=%s",
-                $prevStatusNorm ?? 'NULL',
-                implode('|', $skipStatuses),
-                ($resume && $prevStatusNorm && in_array($prevStatusNorm, $skipStatuses, true)) ? 'YES' : 'NO'
-            ));
-
             if ($resume && $prevStatusNorm && in_array($prevStatusNorm, $skipStatuses, true)) {
                 $io->writeln(sprintf(
-                    "⏭️  Resume: stato nel checkpoint = <fg=yellow>%s</> → salto [%s|%s|%s] (cartella #%03d)",
-                    $prevStatusNorm, $batch, $iddoc, $tipo, $folderNum
+                    "⏭️  Resume: salto gruppo [%s|%s|%s] (stato=%s)",
+                    $batch, $iddoc, $tipo, $prevStatusNorm
                 ));
                 $groupFiles = [];
                 $groupRows  = [];
                 return;
             }
 
-
-            $baseName = $this->buildOutputBase($first, $suffixTitolo);
+            $baseName = $this->buildOutputBase($first);
             $tifDir = $outputBase . "\\TIFF\\" . $folderNum;
             $pdfDir = $outputBase . "\\PDF\\" . $folderNum;
             @mkdir($tifDir, 0777, true);
@@ -168,28 +161,13 @@ final class FileProcessor
             $tifPath = $tifDir . "\\" . $baseName . ".tif";
             $pdfPath = $pdfDir . "\\" . $baseName . ".pdf";
 
-            // Analisi file trovati/mancanti
-            $found = [];
-            $missing = [];
-            foreach ($groupFiles as $f) {
-                if (is_file($f)) $found[] = $f;
-                else $missing[] = $f;
-            }
+            $found = array_filter($groupFiles, 'is_file');
+            $missing = array_diff($groupFiles, $found);
 
             $isTavola = (bool)preg_match('/tavola|elaborato/i', $tipo);
-            $hasSuffix = ($tipo === 'TITOLO_AUTORIZZATIVO');
+            $hasSuffix = (stripos($tipo, 'TITOLO_AUTORIZZATIVO') !== false);
 
-            $this->log->groupStart(
-                $io,
-                $baseName,
-                $folderNum,
-                count($groupFiles),
-                $batch,
-                $iddoc,
-                $tipo,
-                $isTavola,
-                $hasSuffix
-            );
+            $this->log->groupStart($io, $baseName, $folderNum, count($groupFiles), $batch, $iddoc, $tipo, $isTavola, $hasSuffix);
 
             $t0 = microtime(true);
             $status = 'OK';
@@ -205,29 +183,16 @@ final class FileProcessor
                         $status = $mergeStatus;
                     }
                 }
-            } catch (\Throwable $e) {
+            } catch (\Throwable) {
                 $status = 'ERROR';
             }
 
-            // se alcuni file mancanti ma non tutti → OK_PARTIAL
             if ($status === 'OK' && count($missing) > 0) {
                 $status = 'OK_PARTIAL';
             }
 
             $dt = microtime(true) - $t0;
-            $this->log->groupEndDetailed(
-                $io,
-                $baseName,
-                $folderNum,
-                $dt,
-                $status,
-                count($found),
-                count($missing),
-                $batch,
-                $iddoc,
-                $tipo
-            );
-
+            $this->log->groupEndDetailed($io, $baseName, $folderNum, $dt, $status, count($found), count($missing), $batch, $iddoc, $tipo);
             $this->appendCheckpoint($checkpointPath, $batch, $iddoc, $tipo, $folderNum, $status);
 
             if ($progress) $progress->advance();
@@ -236,6 +201,9 @@ final class FileProcessor
             $groupRows = [];
         };
 
+        // ===========================================================
+        // 🧠 Loop principale CSV
+        // ===========================================================
         foreach (CsvReader::iterate($csvPath) as $row) {
             $stato = strtoupper(trim($row['STATO'] ?? ''));
             $batch = trim($row['BATCH'] ?? '');
@@ -245,6 +213,7 @@ final class FileProcessor
             if ($batchFilter && $batch !== $batchFilter) continue;
             if ($tipoFilter && $tipo !== $tipoFilter) continue;
 
+            // Trigger tavole
             if ($stato !== 'CORRETTO' && preg_match('/' . $tavolePattern . '/i', $tipo)) {
                 $prefix = $tipo;
                 continue;
@@ -260,6 +229,19 @@ final class FileProcessor
                 $prefix = null;
             }
 
+            $nome = trim($row['IMMAGINE'] ?? '');
+            $isTavola = preg_match('/tavola|elaborato/i', $tipo);
+
+            // 🆕 Se è una TAVOLA, la elaboriamo come gruppo singolo (senza merge)
+            if ($isTavola && $prefix) {
+                $this->processSingleTavolaRow($row, $folderNum, $prefix, $tavoleBase, $outputBase, $magickPath, $dryRun, $checkpointPath, $io);
+                $groupsDone++;
+                if ($progress) $progress->advance();
+                if ($limitGroups !== null && $groupsDone >= $limitGroups) break;
+                continue;
+            }
+
+            // Raggruppamento standard
             $newGroupKey = "{$batch}|{$tipo}";
             if ($groupKey !== null && $newGroupKey !== $groupKey) {
                 $flush();
@@ -267,16 +249,12 @@ final class FileProcessor
             }
             $groupKey = $newGroupKey;
 
-            $nome = trim($row['IMMAGINE'] ?? '');
+            // Costruisci path sorgente standard
             $ts = strtotime((string)($row['DATA_ORA_ACQ'] ?? ''));
             $yyyy = $ts ? date('Y', $ts) : '0000';
             $mm = $ts ? date('m', $ts) : '00';
             $dd = $ts ? date('d', $ts) : '00';
-            $isPlan = in_array($tipo, $planimetrie, true);
-
-            $src = $isPlan
-                ? ($prefix ? ($tavoleBase . '\\' . $prefix . $nome) : ($tavoleBase . '\\' . $nome))
-                : ($sourceBase . "\\{$yyyy}\\{$mm}\\{$dd}\\{$batch}\\{$nome}");
+            $src = $sourceBase . "\\{$yyyy}\\{$mm}\\{$dd}\\{$batch}\\{$nome}";
 
             $groupFiles[] = $src;
             $groupRows[] = $row;
@@ -286,42 +264,103 @@ final class FileProcessor
 
         $io->newLine(2);
         $memoryUsed = memory_get_peak_usage(true) / 1024 / 1024;
-        $io->success(sprintf(
-            "Completato. Memoria di picco: %.2f MB",
-            $memoryUsed
-        ));
+        $io->success(sprintf("Completato. Memoria di picco: %.2f MB", $memoryUsed));
     }
 
-    // ---------- helper ----------
+    // ===============================================================
+    // 🆕 Gestione TAVOLA singola
+    // ===============================================================
+    private function processSingleTavolaRow(
+        array $row,
+        int $folderNum,
+        string $prefix,
+        string $tavoleBase,
+        string $outputBase,
+        string $magickPath,
+        bool $dryRun,
+        string $checkpointPath,
+        SymfonyStyle $io
+    ): void {
+        $batch = (string)($row['BATCH'] ?? '');
+        $iddoc = (int)($row['IDDOCUMENTO'] ?? 0);
+        $tipo = (string)($row['TIPO_DOCUMENTO'] ?? '');
+        $immagine = trim((string)($row['IMMAGINE'] ?? ''));
 
-    private function buildOutputBase(array $row, string $suffixTitolo): string
+        $src = $this->ops->buildTavolaSourcePath($prefix, $immagine);
+
+        $tifName = "ELABORATO_GRAFICO_" . $immagine;
+        $pdfName = preg_replace('/\.tif$/i', '.pdf', $tifName);
+
+        $tifDst = $outputBase . "\\TIFF\\{$folderNum}\\" . $tifName;
+        $pdfDst = $outputBase . "\\PDF\\{$folderNum}\\" . $pdfName;
+
+        $io->writeln("📄 Tavola: {$src}");
+
+        $status = 'OK';
+        $t0 = microtime(true);
+
+        try {
+            if ($dryRun) {
+                usleep(100000);
+            } else {
+                if (!is_file($src)) {
+                    $this->log->warn("⚠️  Tavola mancante: $src");
+                    $status = 'ERROR';
+                } else {
+                    $okCopy = $this->ops->copyFile($src, $tifDst);
+                    $okPdf = true;
+
+                    if ($okCopy && $this->tavolePdfEnabled) {
+                        $okPdf = $this->ops->convertSingleTiffToPdf($tifDst, $pdfDst);
+                    }
+
+                    if (!$okCopy) $status = 'ERROR';
+                    elseif (!$okPdf) $status = 'OK_PARTIAL';
+                }
+            }
+        } catch (\Throwable $e) {
+            $status = 'ERROR';
+            $this->log->error("❌ Tavola exception: " . $e->getMessage());
+        }
+
+        $dt = microtime(true) - $t0;
+        $this->log->groupEndDetailed($io, basename($tifDst), $folderNum, $dt, $status, $status === 'OK' ? 1 : 0, $status === 'OK' ? 0 : 1, $batch, $iddoc, $tipo);
+        $this->appendCheckpoint($checkpointPath, $batch, $iddoc, $tipo, $folderNum, $status);
+    }
+
+    // ===============================================================
+    // Costruttore nome output (gestisce “TITOLO AUTORIZZATIVO”)
+    // ===============================================================
+    private function buildOutputBase(array $row): string
     {
         $tipoPrat = trim($row['TIPO_PRATICA'] ?? '');
-        $protNum = trim($row['PROT_PRAT_NUMERO'] ?? '');
+        $pratNum = trim($row['PRAT_NUM'] ?? '');
         $protData = trim($row['PROT_PRAT_DATA'] ?? '');
         $anno = substr(preg_replace('/[^0-9]/', '', $protData), -4);
         $tipoDoc = trim($row['TIPO_DOCUMENTO'] ?? '');
+        $siglaPrat = trim($row['SIGLA_PRATICA'] ?? '');
 
-        $suffix = ($tipoDoc === 'TITOLO_AUTORIZZATIVO' && $suffixTitolo !== '') ? $suffixTitolo : '';
-        $name = "{$tipoPrat}_{$protNum}_{$anno}_{$tipoDoc}{$suffix}";
+        // Se contiene “TITOLO AUTORIZZATIVO”, usa SIGLA_PRATICA
+        if (stripos($tipoDoc, 'TITOLO AUTORIZZATIVO') !== false && $siglaPrat !== '') {
+            $tipoDoc = $siglaPrat;
+        }
+
+        $name = "{$tipoPrat}_{$pratNum}_{$anno}_{$tipoDoc}";
         $name = str_replace([' ', '/', '\\', ':', '*', '?', '"', '<', '>', '|'], '_', $name);
         return preg_replace('/_+/', '_', $name);
     }
 
-    /** Carica checkpoint in mappa "BATCH|IDDOC|TIPO" => STATUS */
+    // ---------------------------------------------------------------
+    // Checkpoint helpers (invariati)
+    // ---------------------------------------------------------------
     private function loadCheckpointMap(string $path): array
     {
         $map = [];
-        if (!is_file($path)) {
-            return $map;
-        }
+        if (!is_file($path)) return $map;
 
         $f = fopen($path, 'rb');
-        if (!$f) {
-            return $map;
-        }
-
-        fgetcsv($f); // header
+        if (!$f) return $map;
+        fgetcsv($f);
         while (($r = fgetcsv($f)) !== false) {
             if (count($r) < 6) continue;
             [$b, $i, $t, $folder, $status] = $r;
@@ -332,13 +371,11 @@ final class FileProcessor
         return $map;
     }
 
-    /** Aggiorna o crea riga checkpoint per una chiave univoca */
     private function appendCheckpoint(string $path, string $batch, int $iddoc, string $tipo, int $folderNum, string $status): void
     {
         $header = "BATCH,IDDOCUMENTO,TIPO_DOCUMENTO,FOLDER_NUM,STATUS,UPDATED_AT\n";
         $key = "{$batch}|{$iddoc}|{$tipo}";
 
-        // Carica eventuali dati esistenti
         $rows = [];
         if (is_file($path)) {
             $f = fopen($path, 'rb');
@@ -353,29 +390,12 @@ final class FileProcessor
             }
         }
 
-        // Aggiorna o inserisci
-        $rows[$key] = [
-            $batch,
-            $iddoc,
-            $tipo,
-            $folderNum,
-            $status,
-            (new \DateTimeImmutable())->format('c')
-        ];
+        $rows[$key] = [$batch, $iddoc, $tipo, $folderNum, $status, (new \DateTimeImmutable())->format('c')];
 
-        // Riscrivi il file completo
         @mkdir(dirname($path), 0777, true);
         $f = fopen($path, 'wb');
         fwrite($f, $header);
-        foreach ($rows as $row) {
-            fputcsv($f, $row);
-        }
+        foreach ($rows as $row) fputcsv($f, $row);
         fclose($f);
-    }
-
-
-    private function csv(string $v): string
-    {
-        return str_replace(["\r", "\n"], ' ', $v);
     }
 }

@@ -73,6 +73,9 @@ final class FileOperations
         return $missingCount > 0 ? 'OK_PARTIAL' : 'OK';
     }
 
+    /**
+     * Esegue un comando shell e solleva eccezione se fallisce
+     */
     private function runCommand(string $cmd, string $label): void
     {
         $process = Process::fromShellCommandline($cmd);
@@ -87,5 +90,89 @@ final class FileOperations
                 trim($process->getErrorOutput() ?: $process->getOutput())
             ));
         }
+    }
+
+    // ============================================================
+    // 🆕 NUOVE FUNZIONI PER GESTIONE "TAVOLE" (COPY + PDF)
+    // ============================================================
+
+    /**
+     * Costruisce il path sorgente per le tavole.
+     * Esempio:
+     *  trigger = "abc123", immagine = "000001.tif"
+     *  → \\server\Work\Tavole\Importate\abc123_000001.tif
+     */
+    public function buildTavolaSourcePath(string $triggerValue, string $imageName): string
+    {
+        $base = rtrim((string)($_ENV['TAVOLE_BASE_PATH'] ?? ''), "\\/");
+        $filename = $triggerValue . '_' . $imageName;
+        return $base . DIRECTORY_SEPARATOR . $filename;
+    }
+
+    /**
+     * Copia un file (creando la cartella destinazione se necessario)
+     */
+    public function copyFile(string $src, string $dst): bool
+    {
+        try {
+            $dir = dirname($dst);
+            if (!is_dir($dir)) {
+                @mkdir($dir, 0777, true);
+            }
+
+            if (!file_exists($src)) {
+                $this->logger->warn("⚠️  File sorgente non trovato: $src");
+                return false;
+            }
+
+            if (!@copy($src, $dst)) {
+                $this->logger->error("❌ Copia fallita: $src -> $dst");
+                return false;
+            }
+
+            return true;
+        } catch (\Throwable $e) {
+            $this->logger->error("❌ Errore durante copia: " . $e->getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Conversione TIFF → PDF per singolo file (usata dalle tavole)
+     */
+    public function convertSingleTiffToPdf(string $srcTif, string $dstPdf): bool
+    {
+        $magickPath = $_ENV['MAGICK_PATH'] ?? 'magick';
+        $dir = dirname($dstPdf);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0777, true);
+        }
+
+        if (!file_exists($srcTif)) {
+            $this->logger->warn("⚠️  File TIFF sorgente mancante per conversione: $srcTif");
+            return false;
+        }
+
+        $pdfTmp = $dstPdf . '.tmp.pdf';
+        $cmd = sprintf('"%s" "%s" "%s"', $magickPath, $srcTif, $pdfTmp);
+
+        try {
+            $this->runCommand($cmd, 'tiff2pdf-single');
+            $this->fs->rename($pdfTmp, $dstPdf, true);
+            return true;
+        } catch (\Throwable $e) {
+            $this->logger->error("❌ Errore durante conversione singolo TIFF→PDF: " . $e->getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Utility già presente nel progetto (riconfermata):
+     * Costruisce il path completo di output (Output\TIFF|PDF\{n_cartella}\{filename})
+     */
+    public function buildOutputPath(string $type, int $folderIndex, string $filename): string
+    {
+        $base = rtrim($_ENV['OUTPUT_BASE_PATH'] ?? '', "\\/");
+        return sprintf('%s\\%s\\%03d\\%s', $base, strtoupper($type), $folderIndex, $filename);
     }
 }

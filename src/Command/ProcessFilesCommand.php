@@ -55,7 +55,6 @@ final class ProcessFilesCommand extends Command
         $tavoleBase    = rtrim($_ENV['TAVOLE_BASE_PATH'] ?? 'Work\\Tavole\\Importate', '\\/');
         $tavolePattern = $_ENV['TAVOLE_TRIGGER_PATTERN'] ?? '^[A-Za-z0-9]+\\.?$';
         $planimVals    = array_filter(array_map('trim', explode(';', $_ENV['TAVOLE_PLANIMETRIE_VALUES'] ?? 'ELABORATO_GRAFICO')));
-        $suffixTitolo  = $_ENV['OUTPUT_SUFFIX_TITOLO_AUTORIZZATIVO'] ?? '';
 
         if (!$csvPath || !file_exists($csvPath)) {
             $io->error("CSV non trovato o non valido: $csvPath");
@@ -90,7 +89,6 @@ final class ProcessFilesCommand extends Command
             tavoleBase:     $tavoleBase,
             tavolePattern:  $tavolePattern,
             planimetrie:    $planimVals,
-            suffixTitolo:   $suffixTitolo,
             dryRun:         $dryRun,
             resume:         $resume,
             limitGroups:    $limit > 0 ? $limit : null,
