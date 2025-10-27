@@ -132,19 +132,22 @@ class CheckEnvironmentCommand extends Command
         }
 
         $type = $this->detectPathType($path);
-        $perm = (is_readable($path) ? 'R' : '-') . (is_writable($path) ? 'W' : '-');
         $ping = $this->pingHostFromPath($path) ? 'Host OK' : 'Host KO';
-
         $escaped = addcslashes($path, '\\');
+
+        $permCheck = $this->checkReadWriteAccess($path);
+        $permLabel = sprintf('%s (%s)', $permCheck['flags'], $permCheck['details']);
+
         return sprintf(
             "%s\n  ↳ Tipo: %s | Permessi: %s | %s\n  ↳ Raw: %s",
             $path,
             $type,
-            $perm,
+            $permLabel,
             $ping,
             $escaped
         );
     }
+
 
     private function detectPathType(string $path): string
     {
@@ -166,4 +169,48 @@ class CheckEnvironmentCommand extends Command
         @exec("ping -n 1 -w 1000 " . escapeshellarg($host), $out, $code);
         return $code === 0;
     }
+
+    private function checkReadWriteAccess(string $dir): array
+    {
+        $flags = '';
+        $details = [];
+
+        if (!is_dir($dir)) {
+            return ['flags' => '--', 'details' => 'non directory'];
+        }
+
+        $tmpFile = rtrim($dir, '\\/') . DIRECTORY_SEPARATOR . 'test_rw_' . uniqid() . '.txt';
+
+        // Test scrittura
+        $canWrite = @file_put_contents($tmpFile, 'test-ok-' . date('YmdHis')) !== false;
+        if ($canWrite) {
+            $flags .= 'W';
+            $details[] = 'scrittura OK';
+        } else {
+            $flags .= '-';
+            $details[] = 'scrittura KO';
+        }
+
+        // Test lettura
+        $canRead = $canWrite ? @file_get_contents($tmpFile) !== false : @is_readable($dir);
+        if ($canRead) {
+            $flags = 'R' . $flags;
+            $details[] = 'lettura OK';
+        } else {
+            $flags = '-' . $flags;
+            $details[] = 'lettura KO';
+        }
+
+        // Cleanup
+        if ($canWrite && is_file($tmpFile)) {
+            @unlink($tmpFile);
+        }
+
+        return [
+            'flags' => $flags,
+            'details' => implode(', ', $details),
+        ];
+    }
+
+
 }
